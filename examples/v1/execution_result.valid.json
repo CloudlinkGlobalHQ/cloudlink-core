@@ -1,0 +1,9 @@
+{
+  "action_id": "a1b2c3",
+  "status": "SUCCESS",
+  "observed_impact": {
+    "estimated_monthly_savings_usd": 20.0
+  },
+  "completed_at": "2026-02-01T03:05:00Z",
+  "notes": "simulated execution"
+}
