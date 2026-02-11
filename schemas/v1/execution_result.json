@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ExecutionResult",
+  "type": "object",
+  "required": [
+    "action_id",
+    "status",
+    "completed_at"
+  ],
+  "properties": {
+    "action_id": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["SUCCESS", "FAILED", "ROLLED_BACK"]
+    },
+    "observed_impact": {
+      "type": "object",
+      "additionalProperties": { "type": "number" }
+    },
+    "completed_at": { "type": "string", "format": "date-time" },
+    "notes": { "type": "string" }
+  }
+}

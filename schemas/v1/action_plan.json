@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ActionPlan",
+  "type": "object",
+  "required": [
+    "action_id",
+    "agent",
+    "action_type",
+    "resource_id",
+    "resource_type",
+    "estimated_monthly_savings_usd",
+    "risk_score",
+    "confidence",
+    "created_at"
+  ],
+  "properties": {
+    "action_id": { "type": "string" },
+    "agent": { "type": "string" },
+    "action_type": { "type": "string" },
+    "resource_id": { "type": "string" },
+    "resource_type": { "type": "string" },
+    "proposed_change": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "estimated_monthly_savings_usd": { "type": "number" },
+    "risk_score": { "type": "number" },
+    "confidence": { "type": "number" },
+    "rollback_plan": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string" },
+        "timeout_minutes": { "type": "number" }
+      }
+    },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}
