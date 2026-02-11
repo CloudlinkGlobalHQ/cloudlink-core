@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ResourceStateEvent",
+  "type": "object",
+  "required": [
+    "event_type",
+    "cloud",
+    "resource_type",
+    "resource_id",
+    "account_id",
+    "observed_at"
+  ],
+  "properties": {
+    "event_type": { "const": "ResourceStateEvent" },
+    "cloud": { "type": "string" },
+    "resource_type": { "type": "string" },
+    "resource_id": { "type": "string" },
+    "account_id": { "type": "string" },
+    "region": { "type": "string" },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": { "type": "number" }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "observed_at": { "type": "string", "format": "date-time" }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CostEvent",
+  "type": "object",
+  "required": [
+    "event_type",
+    "cloud",
+    "account_id",
+    "resource_id",
+    "cost_usd",
+    "start_time",
+    "end_time",
+    "ingested_at"
+  ],
+  "properties": {
+    "event_type": { "const": "CostEvent" },
+    "cloud": { "type": "string" },
+    "account_id": { "type": "string" },
+    "region": { "type": "string" },
+    "service": { "type": "string" },
+    "resource_id": { "type": "string" },
+    "usage_type": { "type": "string" },
+    "cost_usd": { "type": "number" },
+    "currency": { "type": "string", "default": "USD" },
+    "start_time": { "type": "string", "format": "date-time" },
+    "end_time": { "type": "string", "format": "date-time" },
+    "tags": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "ingested_at": { "type": "string", "format": "date-time" }
+  }
+}
