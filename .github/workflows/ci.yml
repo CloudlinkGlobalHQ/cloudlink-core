@@ -1,0 +1,33 @@
+name: Core CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies (if present)
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "requirements.txt missing; skipping install"
+          fi
+
+      - name: Run schema validation examples (if present)
+        run: |
+          if [ -f scripts/validate_examples.py ]; then
+            python scripts/validate_examples.py
+          else
+            echo "scripts/validate_examples.py missing; skipping"
+          fi
