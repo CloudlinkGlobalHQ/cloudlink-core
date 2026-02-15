@@ -1,18 +1,14 @@
-import sqlite3
+from __future__ import annotations
+
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
 class SQLiteStateStore:
     """
-    SQLite-backed implementation of the state store.
-
-    This version:
-    - opens DB connection
-    - creates tables automatically
-    - supports execution result ingestion
-    - supports resource storage
+    SQLite-backed implementation of the StateStore contract.
     """
 
     def __init__(self, db_path: str = "cloudlink.db"):
@@ -24,8 +20,15 @@ class SQLiteStateStore:
     # -------------------------
     # Table creation
     # -------------------------
-    def _create_tables(self):
+    def _create_tables(self) -> None:
         cur = self.conn.cursor()
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS resources (
+            resource_id TEXT PRIMARY KEY,
+            payload TEXT
+        )
+        """)
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS execution_results (
@@ -38,22 +41,21 @@ class SQLiteStateStore:
         )
         """)
 
+        # helpful index for agent suppression queries
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS resources (
-            resource_id TEXT PRIMARY KEY,
-            payload TEXT
-        )
+        CREATE INDEX IF NOT EXISTS idx_exec_resource_action
+        ON execution_results(resource_id, action_type)
         """)
 
         self.conn.commit()
 
     # -------------------------
-    # Event / Resource state
+    # Events / Resources
     # -------------------------
     def ingest_event(self, event: Dict[str, Any]) -> None:
-        resource_id = event.get("resource_id")
-        if not resource_id:
-            return
+        rid = event.get("resource_id")
+        if not rid:
+            raise ValueError("event must contain resource_id")
 
         payload = json.dumps(event)
 
@@ -61,7 +63,7 @@ class SQLiteStateStore:
         cur.execute("""
             INSERT OR REPLACE INTO resources (resource_id, payload)
             VALUES (?, ?)
-        """, (resource_id, payload))
+        """, (rid, payload))
         self.conn.commit()
 
     def get_resource(self, resource_id: str) -> Optional[Dict[str, Any]]:
@@ -78,13 +80,16 @@ class SQLiteStateStore:
     def list_resources(self) -> List[Dict[str, Any]]:
         cur = self.conn.cursor()
         cur.execute("SELECT payload FROM resources")
-        rows = cur.fetchall()
-        return [json.loads(r["payload"]) for r in rows]
+        return [json.loads(r["payload"]) for r in cur.fetchall()]
 
     # -------------------------
     # Execution Results
     # -------------------------
     def ingest_execution_result(self, result: Dict[str, Any]) -> None:
+        aid = result.get("action_id")
+        if not aid:
+            raise ValueError("execution result must contain action_id")
+
         payload = json.dumps(result)
 
         cur = self.conn.cursor()
@@ -93,21 +98,36 @@ class SQLiteStateStore:
             (action_id, status, completed_at, resource_id, action_type, payload)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
-            result.get("action_id"),
+            aid,
             result.get("status"),
             result.get("completed_at"),
             result.get("resource_id"),
             result.get("action_type"),
-            payload
+            payload,
         ))
         self.conn.commit()
 
     def list_execution_results(self) -> Dict[str, Dict[str, Any]]:
         cur = self.conn.cursor()
         cur.execute("SELECT action_id, payload FROM execution_results")
-        rows = cur.fetchall()
 
-        out = {}
-        for r in rows:
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in cur.fetchall():
             out[r["action_id"]] = json.loads(r["payload"])
         return out
+
+    # -------------------------
+    # Helper for agents
+    # -------------------------
+    def last_status(self, resource_id: str, action_type: str) -> Optional[str]:
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT status
+            FROM execution_results
+            WHERE resource_id = ? AND action_type = ?
+            ORDER BY completed_at DESC
+            LIMIT 1
+        """, (resource_id, action_type))
+
+        row = cur.fetchone()
+        return None if not row else row["status"]
