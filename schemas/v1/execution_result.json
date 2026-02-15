@@ -1,23 +1,18 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://cloudlink.dev/schemas/v1/execution_result.schema.json",
   "title": "ExecutionResult",
   "type": "object",
-  "required": [
-    "action_id",
-    "status",
-    "completed_at"
-  ],
+  "required": ["action_id", "status", "completed_at"],
+  "additionalProperties": true,
   "properties": {
-    "action_id": { "type": "string" },
-    "status": {
-      "type": "string",
-      "enum": ["SUCCESS", "FAILED", "ROLLED_BACK"]
-    },
-    "observed_impact": {
-      "type": "object",
-      "additionalProperties": { "type": "number" }
-    },
+    "action_id": { "type": "string", "minLength": 1 },
+    "status": { "type": "string", "enum": ["SUCCESS", "FAILED"] },
     "completed_at": { "type": "string", "format": "date-time" },
+
+    "resource_id": { "type": "string" },
+    "action_type": { "type": "string" },
+    "observed_impact": { "type": "object" },
     "notes": { "type": "string" }
   }
 }

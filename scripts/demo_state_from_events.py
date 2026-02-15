@@ -11,7 +11,16 @@ from state.store import InMemoryStateStore
 def main():
     store = InMemoryStateStore()
 
-    with open("../cloudlink-infra/out/events.jsonl", "r", encoding="utf-8") as f:
+    # ~/cloudlink/cloudlink-core/scripts -> ~/cloudlink
+    workspace = Path(__file__).resolve().parents[2]
+    events_path = workspace / "cloudlink-infra" / "out" / "events.jsonl"
+
+    if not events_path.exists():
+        print(f"No events file found at: {events_path}")
+        print("Run cloudlink-infra first to generate out/events.jsonl")
+        return
+
+    with open(events_path, "r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
