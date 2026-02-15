@@ -1,57 +1,67 @@
-from typing import Any, Dict, List
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Protocol
+
+
+class StateStore(Protocol):
+    # ---- Events / Resources ----
+    def ingest_event(self, event: Dict[str, Any]) -> None: ...
+    def get_resource(self, resource_id: str) -> Optional[Dict[str, Any]]: ...
+    def list_resources(self) -> List[Dict[str, Any]]: ...
+
+    # ---- Execution Results ----
+    def ingest_execution_result(self, result: Dict[str, Any]) -> None: ...
+    def list_execution_results(self) -> Dict[str, Dict[str, Any]]: ...
+
+    # ---- Helper for agents ----
+    def last_status(self, resource_id: str, action_type: str) -> Optional[str]: ...
 
 
 class InMemoryStateStore:
+    """
+    Simple in‑memory implementation for testing/dev.
+    """
+
     def __init__(self):
-        self._events: List[Dict[str, Any]] = []
+        self._resources: Dict[str, Dict[str, Any]] = {}
         self._execution_results: Dict[str, Dict[str, Any]] = {}
 
-    # ---- Events ----
+    # ---- Events / Resources ----
     def ingest_event(self, event: Dict[str, Any]) -> None:
-        self._events.append(event)
+        rid = event.get("resource_id")
+        if not rid:
+            raise ValueError("event must contain resource_id")
+        self._resources[rid] = dict(event)
+
+    def get_resource(self, resource_id: str) -> Optional[Dict[str, Any]]:
+        return self._resources.get(resource_id)
 
     def list_resources(self) -> List[Dict[str, Any]]:
-        return list(self._events)
+        return list(self._resources.values())
 
     # ---- Execution Results ----
     def ingest_execution_result(self, result: Dict[str, Any]) -> None:
-        action_id = result["action_id"]
-
-        self._execution_results[action_id] = {
-            "status": result["status"],
-            "completed_at": result["completed_at"],
-            "observed_impact": result.get("observed_impact"),
-            "notes": result.get("notes"),
-        }
+        aid = result.get("action_id")
+        if not aid:
+            raise ValueError("execution result must contain action_id")
+        self._execution_results[aid] = dict(result)
 
     def list_execution_results(self) -> Dict[str, Dict[str, Any]]:
-        return self._execution_results
-# state/store.py
+        return dict(self._execution_results)
 
-class InMemoryStateStore:
-    def __init__(self):
-        # resource_id -> latest event/state
-        self._resources = {}
+    # ---- Helper ----
+    def last_status(self, resource_id: str, action_type: str) -> Optional[str]:
+        latest_ts = ""
+        latest_status: Optional[str] = None
 
-    def ingest_event(self, event: dict):
-        """
-        Store the latest state for a resource.
-        Expects event to contain 'resource_id'.
-        """
-        resource_id = event.get("resource_id")
-        if not resource_id:
-            raise ValueError("event must contain resource_id")
+        for r in self._execution_results.values():
+            if r.get("resource_id") != resource_id:
+                continue
+            if r.get("action_type") != action_type:
+                continue
 
-        self._resources[resource_id] = event
+            ts = r.get("completed_at") or r.get("created_at") or ""
+            if ts >= latest_ts:
+                latest_ts = ts
+                latest_status = r.get("status")
 
-    def get_resource(self, resource_id: str):
-        """
-        Return latest known state for a resource.
-        """
-        return self._resources.get(resource_id)
-
-    def list_resources(self):
-        """
-        Return all known resource states.
-        """
-        return list(self._resources.values())
+        return latest_status
