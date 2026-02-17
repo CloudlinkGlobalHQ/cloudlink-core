@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -14,7 +15,28 @@ class StateStore(Protocol):
 
     # ---- Helper for agents ----
     def last_status(self, resource_id: str, action_type: str) -> Optional[str]: ...
+=======
+from typing import Any, Dict, List, Optional, Protocol
+>>>>>>> 3453fcd (SQLite store updates + execution history)
 
+class StateStore(Protocol):
+    # ... existing methods ...
+
+    # ---- Actions (lifecycle) ----
+    def create_action_if_new(self, action: Dict[str, Any]) -> bool: ...
+    def claim_actions(self, limit: int) -> List[Dict[str, Any]]: ...
+    def update_action(
+        self,
+        action_id: str,
+        *,
+        status: str,
+        updated_at: Optional[str] = None,
+        attempt_count: Optional[int] = None,
+        next_retry_at: Optional[str] = None,
+        last_error: Optional[str] = None,
+    ) -> None: ...
+    
+    
 
 class InMemoryStateStore:
     """
