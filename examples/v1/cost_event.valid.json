@@ -1,0 +1,18 @@
+{
+  "event_type": "CostEvent",
+  "cloud": "aws",
+  "account_id": "111111111111",
+  "region": "us-east-1",
+  "service": "EC2",
+  "resource_id": "i-123",
+  "usage_type": "ComputeHours",
+  "cost_usd": 12.34,
+  "currency": "USD",
+  "start_time": "2026-02-01T00:00:00Z",
+  "end_time": "2026-02-01T01:00:00Z",
+  "tags": {
+    "env": "dev",
+    "team": "platform"
+  },
+  "ingested_at": "2026-02-01T01:05:00Z"
+}

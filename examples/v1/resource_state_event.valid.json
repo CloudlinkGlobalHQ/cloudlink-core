@@ -1,0 +1,13 @@
+{
+  "event_type": "ResourceStateEvent",
+  "cloud": "aws",
+  "account_id": "111111111111",
+  "region": "us-east-1",
+  "resource_id": "i-123",
+  "resource_type": "ec2",
+  "state": {
+    "instance_type": "t3.large",
+    "status": "running"
+  },
+  "observed_at": "2026-02-01T02:00:00Z"
+}
