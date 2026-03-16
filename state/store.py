@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -13,15 +12,6 @@ class StateStore(Protocol):
     def ingest_execution_result(self, result: Dict[str, Any]) -> None: ...
     def list_execution_results(self) -> Dict[str, Dict[str, Any]]: ...
 
-    # ---- Helper for agents ----
-    def last_status(self, resource_id: str, action_type: str) -> Optional[str]: ...
-=======
-from typing import Any, Dict, List, Optional, Protocol
->>>>>>> 3453fcd (SQLite store updates + execution history)
-
-class StateStore(Protocol):
-    # ... existing methods ...
-
     # ---- Actions (lifecycle) ----
     def create_action_if_new(self, action: Dict[str, Any]) -> bool: ...
     def claim_actions(self, limit: int) -> List[Dict[str, Any]]: ...
@@ -35,12 +25,15 @@ class StateStore(Protocol):
         next_retry_at: Optional[str] = None,
         last_error: Optional[str] = None,
     ) -> None: ...
-    
-    
+
+    # ---- Helper for agents ----
+    def last_status(self, resource_id: str, action_type: str) -> Optional[str]: ...
+    def has_active_action(self, resource_id: str, action_type: str) -> bool: ...
+
 
 class InMemoryStateStore:
     """
-    Simple in‑memory implementation for testing/dev.
+    Simple in-memory implementation for testing/dev.
     """
 
     def __init__(self):
@@ -87,3 +80,7 @@ class InMemoryStateStore:
                 latest_status = r.get("status")
 
         return latest_status
+
+    def has_active_action(self, resource_id: str, action_type: str) -> bool:
+        # In-memory store doesn't track action lifecycle — always returns False
+        return False

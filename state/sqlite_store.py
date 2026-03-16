@@ -463,3 +463,16 @@ class SQLiteStateStore:
         cur.execute("SELECT status, COUNT(*) AS n FROM actions GROUP BY status")
         rows = cur.fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
+
+    def has_active_action(self, resource_id: str, action_type: str) -> bool:
+        """Return True if a PENDING, IN_PROGRESS, or RETRY action exists for this resource+type."""
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*) AS n
+            FROM actions
+            WHERE resource_id = ?
+              AND action_type = ?
+              AND status IN ('PENDING', 'IN_PROGRESS', 'RETRY')
+        """, (resource_id, action_type))
+        row = cur.fetchone()
+        return int(row["n"]) > 0
