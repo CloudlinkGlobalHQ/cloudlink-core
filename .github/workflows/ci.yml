@@ -3,31 +3,32 @@ name: Core CI
 on:
   pull_request:
   push:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
-  validate:
+  test:
+    name: Test & Validate
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
+          cache: "pip"
 
-      - name: Install dependencies (if present)
-        run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            echo "requirements.txt missing; skipping install"
-          fi
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
 
-      - name: Run schema validation examples (if present)
+      - name: Run test suite
+        run: python -m pytest tests/ -v --tb=short
+
+      - name: Validate JSON schema examples
         run: |
           if [ -f scripts/validate_examples.py ]; then
             python scripts/validate_examples.py
           else
-            echo "scripts/validate_examples.py missing; skipping"
+            echo "scripts/validate_examples.py not found, skipping"
           fi
