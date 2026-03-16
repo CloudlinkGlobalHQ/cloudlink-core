@@ -141,10 +141,7 @@ class SQLiteStateStore:
         CREATE INDEX IF NOT EXISTS idx_exec_resource_action
         ON execution_results(resource_id, action_type)
         """)
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_exec_tenant
-        ON execution_results(tenant_id)
-        """)
+        # idx_exec_tenant created in _migrate_tables() after tenant_id column is ensured
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS actions (
@@ -172,10 +169,7 @@ class SQLiteStateStore:
         CREATE INDEX IF NOT EXISTS idx_actions_resource
         ON actions(resource_id, action_type)
         """)
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_actions_tenant_status
-        ON actions(tenant_id, status)
-        """)
+        # idx_actions_tenant_status created in _migrate_tables() after tenant_id column is ensured
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS runs (
@@ -195,10 +189,7 @@ class SQLiteStateStore:
         CREATE INDEX IF NOT EXISTS idx_runs_started_at
         ON runs(started_at)
         """)
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_runs_tenant
-        ON runs(tenant_id)
-        """)
+        # idx_runs_tenant created in _migrate_tables() after tenant_id column is ensured
 
         self.conn.commit()
 
@@ -221,6 +212,11 @@ class SQLiteStateStore:
             existing_cols = {row["name"] for row in cur.fetchall()}
             if "tenant_id" not in existing_cols:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
+
+        # Create tenant_id indexes now that the column is guaranteed to exist
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_exec_tenant ON execution_results(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_actions_tenant_status ON actions(tenant_id, status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_tenant ON runs(tenant_id)")
 
         self.conn.commit()
 
