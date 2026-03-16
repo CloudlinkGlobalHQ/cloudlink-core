@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloudlink-core"
+version = "0.1.0"
+description = "Cloudlink Global — core state store and shared utilities"
+requires-python = ">=3.9"
+dependencies = [
+    "cryptography>=42.0.0",
+    "jsonschema>=4.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cloudlink_core*"]
