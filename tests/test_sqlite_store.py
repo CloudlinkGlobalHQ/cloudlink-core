@@ -32,6 +32,18 @@ def _store() -> SQLiteStateStore:
     return SQLiteStateStore(db_path=tempfile.mktemp(suffix=".db"))
 
 
+def _store_no_approval(*action_types: str) -> SQLiteStateStore:
+    """Store with approval disabled for the given action types on the default tenant.
+
+    Used in lifecycle tests (claim → execute → update) that are not testing
+    the approval workflow itself — those tests live in test_multi_tenant.py.
+    """
+    s = _store()
+    for at in action_types:
+        s.set_approval_policy("default", at, require_approval=False)
+    return s
+
+
 def _action(resource_id="r-1", action_type="close_open_ssh", key=None) -> dict:
     now = _now()
     return {
@@ -111,14 +123,14 @@ class TestCreateActionIfNew:
 
 class TestClaimActions:
     def test_claiming_sets_in_progress(self):
-        store = _store()
+        store = _store_no_approval("close_open_ssh")
         store.create_action_if_new(_action())
         claimed = store.claim_actions(limit=10)
         assert len(claimed) == 1
         assert claimed[0]["status"] == "IN_PROGRESS"
 
     def test_no_double_claiming(self):
-        store = _store()
+        store = _store_no_approval("close_open_ssh")
         store.create_action_if_new(_action())
         first = store.claim_actions(limit=10)
         second = store.claim_actions(limit=10)
@@ -126,14 +138,14 @@ class TestClaimActions:
         assert len(second) == 0
 
     def test_respects_limit(self):
-        store = _store()
+        store = _store_no_approval("close_open_ssh")
         for _ in range(5):
             store.create_action_if_new(_action())
         claimed = store.claim_actions(limit=2)
         assert len(claimed) == 2
 
     def test_retry_with_past_next_retry_at_is_claimed(self):
-        store = _store()
+        store = _store_no_approval("close_open_ssh")
         a = _action()
         store.create_action_if_new(a)
         claimed = store.claim_actions(limit=1)
@@ -147,7 +159,7 @@ class TestClaimActions:
         assert len(reclaimed) == 1
 
     def test_retry_with_future_next_retry_at_is_not_claimed(self):
-        store = _store()
+        store = _store_no_approval("close_open_ssh")
         a = _action()
         store.create_action_if_new(a)
         claimed = store.claim_actions(limit=1)
@@ -166,7 +178,7 @@ class TestClaimActions:
 
 class TestUpdateAction:
     def test_success_transition(self):
-        store = _store()
+        store = _store_no_approval("close_open_ssh")
         store.create_action_if_new(_action())
         claimed = store.claim_actions(limit=1)
         action_id = claimed[0]["action_id"]
@@ -174,7 +186,7 @@ class TestUpdateAction:
         assert store.get_action(action_id)["status"] == "SUCCESS"
 
     def test_retry_stores_all_fields(self):
-        store = _store()
+        store = _store_no_approval("close_open_ssh")
         store.create_action_if_new(_action())
         claimed = store.claim_actions(limit=1)
         action_id = claimed[0]["action_id"]
@@ -203,20 +215,20 @@ class TestHasActiveAction:
         assert store.has_active_action("sg-1", "close_open_ssh") is True
 
     def test_true_for_in_progress(self):
-        store = _store()
+        store = _store_no_approval("close_open_ssh")
         store.create_action_if_new(_action(resource_id="sg-1", action_type="close_open_ssh"))
         store.claim_actions(limit=1)
         assert store.has_active_action("sg-1", "close_open_ssh") is True
 
     def test_true_for_retry(self):
-        store = _store()
+        store = _store_no_approval("close_open_ssh")
         store.create_action_if_new(_action(resource_id="sg-1", action_type="close_open_ssh"))
         claimed = store.claim_actions(limit=1)
         store.update_action(claimed[0]["action_id"], status="RETRY")
         assert store.has_active_action("sg-1", "close_open_ssh") is True
 
     def test_false_after_success(self):
-        store = _store()
+        store = _store_no_approval("close_open_ssh")
         store.create_action_if_new(_action(resource_id="sg-1", action_type="close_open_ssh"))
         claimed = store.claim_actions(limit=1)
         store.update_action(claimed[0]["action_id"], status="SUCCESS")
@@ -272,7 +284,7 @@ class TestRunLifecycle:
 
 class TestExecutionResults:
     def test_ingest_and_retrieve(self):
-        store = _store()
+        store = _store_no_approval("close_open_ssh")
         store.create_action_if_new(_action())
         claimed = store.claim_actions(limit=1)
         action_id = claimed[0]["action_id"]
@@ -290,7 +302,7 @@ class TestExecutionResults:
         assert results[0]["status"] == "SUCCESS"
 
     def test_multiple_results_per_action(self):
-        store = _store()
+        store = _store_no_approval("close_open_ssh")
         store.create_action_if_new(_action())
         claimed = store.claim_actions(limit=1)
         action_id = claimed[0]["action_id"]
