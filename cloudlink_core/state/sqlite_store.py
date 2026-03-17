@@ -54,8 +54,16 @@ class SQLiteStateStore:
 
     def __init__(self, db_path: str = "cloudlink.db"):
         self.db_path = Path(db_path)
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,
+            timeout=30,
+        )
         self.conn.row_factory = sqlite3.Row
+        # WAL mode: allows concurrent readers + one writer without locking
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.commit()
         self._create_tables()
         self._migrate_tables()
         self._seed_default_tenant()
