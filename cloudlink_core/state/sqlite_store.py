@@ -191,6 +191,45 @@ class SQLiteStateStore:
         """)
         # idx_runs_tenant created in _migrate_tables() after tenant_id column is ensured
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS scan_history (
+            scan_id          TEXT PRIMARY KEY,
+            tenant_id        TEXT NOT NULL,
+            credential_id    TEXT,
+            credential_label TEXT,
+            regions          TEXT,
+            started_at       TEXT NOT NULL,
+            finished_at      TEXT,
+            status           TEXT NOT NULL DEFAULT 'running',
+            events_found     INTEGER DEFAULT 0,
+            events_ingested  INTEGER DEFAULT 0,
+            actions_queued   INTEGER DEFAULT 0,
+            error            TEXT
+        )
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_scans_tenant
+        ON scan_history(tenant_id, started_at)
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS webhooks (
+            webhook_id    TEXT PRIMARY KEY,
+            tenant_id     TEXT NOT NULL,
+            url           TEXT NOT NULL,
+            secret        TEXT,
+            events        TEXT NOT NULL DEFAULT '["action.created","action.completed","scan.finished"]',
+            enabled       INTEGER NOT NULL DEFAULT 1,
+            created_at    TEXT NOT NULL,
+            last_fired_at TEXT,
+            last_status   TEXT
+        )
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_webhooks_tenant
+        ON webhooks(tenant_id)
+        """)
+
         self.conn.commit()
 
     def _migrate_tables(self) -> None:
@@ -755,3 +794,152 @@ class SQLiteStateStore:
             GROUP BY status
         """, (tenant_id,))
         return {r["status"]: int(r["n"]) for r in cur.fetchall()}
+
+    # ------------------------------------------------------------------
+    # Scan History
+    # ------------------------------------------------------------------
+
+    def create_scan(
+        self,
+        tenant_id: str,
+        credential_id: Optional[str] = None,
+        credential_label: Optional[str] = None,
+        regions: Optional[List[str]] = None,
+    ) -> str:
+        scan_id = str(uuid.uuid4())
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT INTO scan_history
+            (scan_id, tenant_id, credential_id, credential_label, regions, started_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'running')
+        """, (
+            scan_id, tenant_id, credential_id, credential_label,
+            json.dumps(regions or []), _now_iso(),
+        ))
+        self.conn.commit()
+        return scan_id
+
+    def finish_scan(
+        self,
+        scan_id: str,
+        *,
+        events_found: int = 0,
+        events_ingested: int = 0,
+        actions_queued: int = 0,
+        error: Optional[str] = None,
+    ) -> None:
+        status = "error" if error else "finished"
+        cur = self.conn.cursor()
+        cur.execute("""
+            UPDATE scan_history
+            SET finished_at=?, status=?, events_found=?, events_ingested=?, actions_queued=?, error=?
+            WHERE scan_id=?
+        """, (_now_iso(), status, events_found, events_ingested, actions_queued, error, scan_id))
+        self.conn.commit()
+
+    def list_scans(self, tenant_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT * FROM scan_history WHERE tenant_id = ?
+            ORDER BY started_at DESC LIMIT ?
+        """, (tenant_id, int(limit)))
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            try:
+                d["regions"] = json.loads(d["regions"] or "[]")
+            except Exception:
+                d["regions"] = []
+            rows.append(d)
+        return rows
+
+    # ------------------------------------------------------------------
+    # Webhooks
+    # ------------------------------------------------------------------
+
+    def add_webhook(
+        self,
+        tenant_id: str,
+        url: str,
+        secret: Optional[str] = None,
+        events: Optional[List[str]] = None,
+    ) -> str:
+        webhook_id = str(uuid.uuid4())
+        default_events = ["action.created", "action.completed", "scan.finished"]
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT INTO webhooks (webhook_id, tenant_id, url, secret, events, enabled, created_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?)
+        """, (
+            webhook_id, tenant_id, url, secret,
+            json.dumps(events or default_events), _now_iso(),
+        ))
+        self.conn.commit()
+        return webhook_id
+
+    def list_webhooks(self, tenant_id: str) -> List[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT * FROM webhooks WHERE tenant_id = ? ORDER BY created_at
+        """, (tenant_id,))
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            try:
+                d["events"] = json.loads(d["events"] or "[]")
+            except Exception:
+                d["events"] = []
+            rows.append(d)
+        return rows
+
+    def delete_webhook(self, tenant_id: str, webhook_id: str) -> bool:
+        cur = self.conn.cursor()
+        cur.execute("""
+            DELETE FROM webhooks WHERE webhook_id = ? AND tenant_id = ?
+        """, (webhook_id, tenant_id))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def update_webhook_status(self, webhook_id: str, status: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute("""
+            UPDATE webhooks SET last_fired_at=?, last_status=? WHERE webhook_id=?
+        """, (_now_iso(), status, webhook_id))
+        self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Notification helper (fire-and-forget HTTP POST to webhooks)
+    # ------------------------------------------------------------------
+
+    def fire_webhooks(self, tenant_id: str, event_type: str, payload: Dict[str, Any]) -> None:
+        """Fire matching webhooks for a tenant event. Errors are silently swallowed."""
+        try:
+            import threading
+            import urllib.request
+
+            webhooks = self.list_webhooks(tenant_id)
+            for wh in webhooks:
+                if not wh.get("enabled"):
+                    continue
+                if event_type not in wh.get("events", []):
+                    continue
+
+                body = json.dumps({"event": event_type, "payload": payload}).encode()
+                headers = {"Content-Type": "application/json"}
+                if wh.get("secret"):
+                    import hashlib
+                    import hmac
+                    sig = hmac.new(wh["secret"].encode(), body, hashlib.sha256).hexdigest()
+                    headers["X-Cloudlink-Signature"] = f"sha256={sig}"
+
+                def _send(url=wh["url"], wid=wh["webhook_id"], b=body, h=headers):
+                    try:
+                        req = urllib.request.Request(url, data=b, headers=h, method="POST")
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            self.update_webhook_status(wid, str(resp.status))
+                    except Exception as exc:
+                        self.update_webhook_status(wid, f"error: {exc}")
+
+                threading.Thread(target=_send, daemon=True).start()
+        except Exception:
+            pass
