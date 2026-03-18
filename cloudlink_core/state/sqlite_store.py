@@ -165,6 +165,8 @@ class SQLiteStateStore:
             attempt_count  INTEGER NOT NULL DEFAULT 0,
             next_retry_at  TEXT,
             last_error     TEXT,
+            reason         TEXT,
+            confidence     REAL,
             created_at     TEXT NOT NULL,
             updated_at     TEXT NOT NULL
         )
@@ -248,17 +250,20 @@ class SQLiteStateStore:
         cur = self.conn.cursor()
 
         migrations = {
-            "resources":         "tenant_id TEXT NOT NULL DEFAULT 'default'",
-            "actions":           "tenant_id TEXT NOT NULL DEFAULT 'default'",
-            "execution_results": "tenant_id TEXT NOT NULL DEFAULT 'default'",
-            "runs":              "tenant_id TEXT NOT NULL DEFAULT 'default'",
+            "resources":         [("tenant_id", "TEXT NOT NULL DEFAULT 'default'")],
+            "actions":           [("tenant_id", "TEXT NOT NULL DEFAULT 'default'"),
+                                  ("reason",    "TEXT"),
+                                  ("confidence","REAL")],
+            "execution_results": [("tenant_id", "TEXT NOT NULL DEFAULT 'default'")],
+            "runs":              [("tenant_id", "TEXT NOT NULL DEFAULT 'default'")],
         }
 
-        for table, col_def in migrations.items():
+        for table, col_defs in migrations.items():
             cur.execute(f"PRAGMA table_info({table})")
             existing_cols = {row["name"] for row in cur.fetchall()}
-            if "tenant_id" not in existing_cols:
-                cur.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
+            for col_name, col_def in col_defs:
+                if col_name not in existing_cols:
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
 
         # Create tenant_id indexes now that the column is guaranteed to exist
         cur.execute("CREATE INDEX IF NOT EXISTS idx_exec_tenant ON execution_results(tenant_id)")
@@ -576,8 +581,8 @@ class SQLiteStateStore:
                 INSERT INTO actions (
                     action_id, tenant_id, action_key, agent, action_type, resource_id,
                     resource_type, proposed_change, status, attempt_count,
-                    next_retry_at, last_error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    next_retry_at, last_error, reason, confidence, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 action["action_id"],
                 tenant_id,
@@ -591,6 +596,8 @@ class SQLiteStateStore:
                 int(action.get("attempt_count") or 0),
                 action.get("next_retry_at"),
                 action.get("last_error"),
+                action.get("reason"),
+                action.get("confidence"),
                 action["created_at"],
                 action["updated_at"],
             ))
@@ -740,6 +747,7 @@ class SQLiteStateStore:
     # ------------------------------------------------------------------
 
     def _row_to_action(self, r: sqlite3.Row) -> Dict[str, Any]:
+        keys = r.keys() if hasattr(r, "keys") else []
         return {
             "action_id":      r["action_id"],
             "tenant_id":      r["tenant_id"],
@@ -753,6 +761,8 @@ class SQLiteStateStore:
             "attempt_count":  int(r["attempt_count"] or 0),
             "next_retry_at":  r["next_retry_at"],
             "last_error":     r["last_error"],
+            "reason":         r["reason"] if "reason" in keys else None,
+            "confidence":     r["confidence"] if "confidence" in keys else None,
             "created_at":     r["created_at"],
             "updated_at":     r["updated_at"],
         }
