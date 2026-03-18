@@ -240,6 +240,69 @@ class SQLiteStateStore:
         ON webhooks(tenant_id)
         """)
 
+        # ── Cost regression pipeline ───────────────────────────────────────
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS cost_snapshots (
+            snapshot_id   TEXT PRIMARY KEY,
+            tenant_id     TEXT NOT NULL,
+            credential_id TEXT,
+            service       TEXT NOT NULL,
+            hour          TEXT NOT NULL,
+            cost_usd      REAL NOT NULL,
+            recorded_at   TEXT NOT NULL
+        )
+        """)
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cost_snapshot_uniq
+        ON cost_snapshots(tenant_id, service, hour)
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cost_snapshot_tenant_svc
+        ON cost_snapshots(tenant_id, service, hour)
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS deploy_events (
+            deploy_id    TEXT PRIMARY KEY,
+            tenant_id    TEXT NOT NULL,
+            service      TEXT NOT NULL,
+            version      TEXT,
+            environment  TEXT NOT NULL DEFAULT 'production',
+            deployed_at  TEXT NOT NULL,
+            source       TEXT,
+            metadata     TEXT
+        )
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_deploy_tenant_service
+        ON deploy_events(tenant_id, service, deployed_at)
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS cost_regressions (
+            regression_id  TEXT PRIMARY KEY,
+            tenant_id      TEXT NOT NULL,
+            deploy_id      TEXT NOT NULL,
+            service        TEXT NOT NULL,
+            baseline_cost  REAL NOT NULL,
+            post_cost      REAL NOT NULL,
+            change_pct     REAL NOT NULL,
+            monthly_impact REAL NOT NULL,
+            detected_at    TEXT NOT NULL,
+            status         TEXT NOT NULL DEFAULT 'open',
+            confidence     TEXT NOT NULL DEFAULT 'high'
+        )
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_regression_tenant
+        ON cost_regressions(tenant_id, detected_at)
+        """)
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_regression_deploy_svc
+        ON cost_regressions(deploy_id, service)
+        """)
+
         self.conn.commit()
 
     def _migrate_tables(self) -> None:
@@ -928,6 +991,310 @@ class SQLiteStateStore:
     # ------------------------------------------------------------------
     # Notification helper (fire-and-forget HTTP POST to webhooks)
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Cost Snapshots
+    # ------------------------------------------------------------------
+
+    def record_cost_snapshot(
+        self,
+        tenant_id: str,
+        service: str,
+        hour: str,
+        cost_usd: float,
+        credential_id: Optional[str] = None,
+    ) -> None:
+        """Upsert a per-service hourly cost reading. Idempotent on (tenant, service, hour)."""
+        snapshot_id = str(uuid.uuid4())
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT INTO cost_snapshots
+                (snapshot_id, tenant_id, credential_id, service, hour, cost_usd, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id, service, hour) DO UPDATE SET
+                cost_usd    = excluded.cost_usd,
+                recorded_at = excluded.recorded_at
+        """, (snapshot_id, tenant_id, credential_id, service, hour, cost_usd, _now_iso()))
+        self.conn.commit()
+
+    def get_cost_baseline(
+        self,
+        tenant_id: str,
+        service: str,
+        before_hour: str,
+        lookback_hours: int = 168,  # 7 days
+    ) -> Optional[float]:
+        """
+        Return the average hourly cost for `service` over the `lookback_hours` window
+        that ends at (but excludes) `before_hour`. Returns None if no data.
+        """
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT AVG(cost_usd) AS avg_cost, COUNT(*) AS n
+            FROM cost_snapshots
+            WHERE tenant_id = ?
+              AND service   = ?
+              AND hour      < ?
+            ORDER BY hour DESC
+            LIMIT ?
+        """, (tenant_id, service, before_hour, lookback_hours))
+        row = cur.fetchone()
+        if not row or row["n"] == 0:
+            return None
+        return row["avg_cost"]
+
+    def get_post_deploy_cost(
+        self,
+        tenant_id: str,
+        service: str,
+        after_hour: str,
+        window_hours: int = 3,
+    ) -> Optional[float]:
+        """
+        Return the average hourly cost for `service` in the `window_hours` window
+        starting at `after_hour`. Returns None if no data yet.
+        """
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT AVG(cost_usd) AS avg_cost, COUNT(*) AS n
+            FROM (
+                SELECT cost_usd FROM cost_snapshots
+                WHERE tenant_id = ?
+                  AND service   = ?
+                  AND hour      >= ?
+                ORDER BY hour ASC
+                LIMIT ?
+            )
+        """, (tenant_id, service, after_hour, window_hours))
+        row = cur.fetchone()
+        if not row or row["n"] == 0:
+            return None
+        return row["avg_cost"]
+
+    def list_cost_snapshots(
+        self,
+        tenant_id: str,
+        service: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        if service:
+            cur.execute("""
+                SELECT * FROM cost_snapshots
+                WHERE tenant_id = ? AND service = ?
+                ORDER BY hour DESC LIMIT ?
+            """, (tenant_id, service, limit))
+        else:
+            cur.execute("""
+                SELECT * FROM cost_snapshots
+                WHERE tenant_id = ?
+                ORDER BY hour DESC LIMIT ?
+            """, (tenant_id, limit))
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_tracked_services(self, tenant_id: str) -> List[str]:
+        """Return distinct service names that have cost snapshots."""
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT service FROM cost_snapshots
+            WHERE tenant_id = ?
+            ORDER BY service
+        """, (tenant_id,))
+        return [r["service"] for r in cur.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Deploy Events
+    # ------------------------------------------------------------------
+
+    def create_deploy_event(
+        self,
+        tenant_id: str,
+        service: str,
+        deployed_at: str,
+        version: Optional[str] = None,
+        environment: str = "production",
+        source: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        deploy_id = str(uuid.uuid4())
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT INTO deploy_events
+                (deploy_id, tenant_id, service, version, environment, deployed_at, source, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            deploy_id, tenant_id, service, version, environment,
+            deployed_at, source, json.dumps(metadata or {}),
+        ))
+        self.conn.commit()
+        return deploy_id
+
+    def get_deploy_event(self, deploy_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT * FROM deploy_events WHERE deploy_id = ? AND tenant_id = ?
+        """, (deploy_id, tenant_id))
+        row = cur.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["metadata"] = json.loads(d.get("metadata") or "{}")
+        return d
+
+    def list_deploy_events(
+        self,
+        tenant_id: str,
+        service: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        if service:
+            cur.execute("""
+                SELECT * FROM deploy_events
+                WHERE tenant_id = ? AND service = ?
+                ORDER BY deployed_at DESC LIMIT ?
+            """, (tenant_id, service, limit))
+        else:
+            cur.execute("""
+                SELECT * FROM deploy_events
+                WHERE tenant_id = ?
+                ORDER BY deployed_at DESC LIMIT ?
+            """, (tenant_id, limit))
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            d["metadata"] = json.loads(d.get("metadata") or "{}")
+            rows.append(d)
+        return rows
+
+    def get_deploys_pending_analysis(
+        self,
+        tenant_id: str,
+        min_hours_elapsed: float = 2.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return deploy events that:
+          1. Were deployed at least `min_hours_elapsed` hours ago
+          2. Do not yet have a regression record (checked or clean)
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=min_hours_elapsed)
+        cutoff_iso = cutoff.isoformat()
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT d.* FROM deploy_events d
+            WHERE d.tenant_id = ?
+              AND d.deployed_at <= ?
+              AND NOT EXISTS (
+                SELECT 1 FROM cost_regressions r
+                WHERE r.deploy_id = d.deploy_id
+                  AND r.service   = d.service
+              )
+            ORDER BY d.deployed_at ASC
+        """, (tenant_id, cutoff_iso))
+        rows = []
+        for r in cur.fetchall():
+            dd = dict(r)
+            dd["metadata"] = json.loads(dd.get("metadata") or "{}")
+            rows.append(dd)
+        return rows
+
+    # ------------------------------------------------------------------
+    # Cost Regressions
+    # ------------------------------------------------------------------
+
+    def create_regression(
+        self,
+        tenant_id: str,
+        deploy_id: str,
+        service: str,
+        baseline_cost: float,
+        post_cost: float,
+        change_pct: float,
+        monthly_impact: float,
+        confidence: str = "high",
+    ) -> str:
+        regression_id = str(uuid.uuid4())
+        cur = self.conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO cost_regressions
+                    (regression_id, tenant_id, deploy_id, service,
+                     baseline_cost, post_cost, change_pct, monthly_impact,
+                     detected_at, status, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            """, (
+                regression_id, tenant_id, deploy_id, service,
+                baseline_cost, post_cost, round(change_pct, 2),
+                round(monthly_impact, 2), _now_iso(), confidence,
+            ))
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            # duplicate (deploy_id, service) — already recorded
+            return ""
+        return regression_id
+
+    def acknowledge_regression(self, regression_id: str, tenant_id: str) -> bool:
+        cur = self.conn.cursor()
+        cur.execute("""
+            UPDATE cost_regressions SET status = 'acknowledged'
+            WHERE regression_id = ? AND tenant_id = ? AND status = 'open'
+        """, (regression_id, tenant_id))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def resolve_regression(self, regression_id: str, tenant_id: str) -> bool:
+        cur = self.conn.cursor()
+        cur.execute("""
+            UPDATE cost_regressions SET status = 'resolved'
+            WHERE regression_id = ? AND tenant_id = ?
+        """, (regression_id, tenant_id))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def list_regressions(
+        self,
+        tenant_id: str,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        if status:
+            cur.execute("""
+                SELECT r.*, d.version, d.environment, d.deployed_at, d.source, d.metadata AS deploy_metadata
+                FROM cost_regressions r
+                LEFT JOIN deploy_events d ON r.deploy_id = d.deploy_id
+                WHERE r.tenant_id = ? AND r.status = ?
+                ORDER BY r.detected_at DESC LIMIT ?
+            """, (tenant_id, status, limit))
+        else:
+            cur.execute("""
+                SELECT r.*, d.version, d.environment, d.deployed_at, d.source, d.metadata AS deploy_metadata
+                FROM cost_regressions r
+                LEFT JOIN deploy_events d ON r.deploy_id = d.deploy_id
+                WHERE r.tenant_id = ?
+                ORDER BY r.detected_at DESC LIMIT ?
+            """, (tenant_id, limit))
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            d["deploy_metadata"] = json.loads(d.get("deploy_metadata") or "{}")
+            rows.append(d)
+        return rows
+
+    def get_regression(self, regression_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT r.*, d.version, d.environment, d.deployed_at, d.source, d.metadata AS deploy_metadata
+            FROM cost_regressions r
+            LEFT JOIN deploy_events d ON r.deploy_id = d.deploy_id
+            WHERE r.regression_id = ? AND r.tenant_id = ?
+        """, (regression_id, tenant_id))
+        row = cur.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["deploy_metadata"] = json.loads(d.get("deploy_metadata") or "{}")
+        return d
 
     def fire_webhooks(self, tenant_id: str, event_type: str, payload: Dict[str, Any]) -> None:
         """Fire matching webhooks for a tenant event. Errors are silently swallowed."""
