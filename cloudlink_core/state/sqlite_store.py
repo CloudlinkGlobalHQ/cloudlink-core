@@ -62,6 +62,7 @@ class SQLiteStateStore:
         self.conn.row_factory = sqlite3.Row
         # WAL mode: allows concurrent readers + one writer without locking
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=10000")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.commit()
         self._create_tables()
