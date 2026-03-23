@@ -304,6 +304,30 @@ class SQLiteStateStore:
         ON cost_regressions(deploy_id, service)
         """)
 
+        # ── Subscriptions (Stripe billing) ──────────────────────────────────
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            clerk_user_id       TEXT NOT NULL,
+            tenant_id           TEXT NOT NULL DEFAULT 'default',
+            stripe_customer_id  TEXT,
+            stripe_subscription_id TEXT,
+            plan                TEXT NOT NULL DEFAULT 'free',
+            status              TEXT NOT NULL DEFAULT 'active',
+            current_period_end  TEXT,
+            created_at          TEXT NOT NULL,
+            updated_at          TEXT NOT NULL
+        )
+        """)
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_clerk_user
+        ON subscriptions(clerk_user_id)
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_sub_stripe_customer
+        ON subscriptions(stripe_customer_id)
+        """)
+
         self.conn.commit()
 
     def _migrate_tables(self) -> None:
@@ -1329,3 +1353,72 @@ class SQLiteStateStore:
                 threading.Thread(target=_send, daemon=True).start()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Subscriptions (Stripe billing)
+    # ------------------------------------------------------------------
+
+    def upsert_subscription(
+        self,
+        clerk_user_id: str,
+        *,
+        tenant_id: str = "default",
+        stripe_customer_id: Optional[str] = None,
+        stripe_subscription_id: Optional[str] = None,
+        plan: str = "free",
+        status: str = "active",
+        current_period_end: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        now = _now_iso()
+        cur = self.conn.cursor()
+        existing = cur.execute(
+            "SELECT id FROM subscriptions WHERE clerk_user_id = ?",
+            (clerk_user_id,),
+        ).fetchone()
+
+        if existing:
+            cur.execute(
+                """UPDATE subscriptions
+                   SET stripe_customer_id = COALESCE(?, stripe_customer_id),
+                       stripe_subscription_id = COALESCE(?, stripe_subscription_id),
+                       plan = ?,
+                       status = ?,
+                       current_period_end = COALESCE(?, current_period_end),
+                       tenant_id = ?,
+                       updated_at = ?
+                 WHERE clerk_user_id = ?""",
+                (stripe_customer_id, stripe_subscription_id, plan, status,
+                 current_period_end, tenant_id, now, clerk_user_id),
+            )
+        else:
+            cur.execute(
+                """INSERT INTO subscriptions
+                   (clerk_user_id, tenant_id, stripe_customer_id, stripe_subscription_id,
+                    plan, status, current_period_end, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (clerk_user_id, tenant_id, stripe_customer_id, stripe_subscription_id,
+                 plan, status, current_period_end, now, now),
+            )
+        self.conn.commit()
+        return self.get_subscription(clerk_user_id)  # type: ignore
+
+    def get_subscription(self, clerk_user_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM subscriptions WHERE clerk_user_id = ?",
+            (clerk_user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_subscription_by_customer(self, stripe_customer_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM subscriptions WHERE stripe_customer_id = ?",
+            (stripe_customer_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def cancel_subscription(self, clerk_user_id: str) -> None:
+        self.conn.execute(
+            "UPDATE subscriptions SET status = 'cancelled', plan = 'free', updated_at = ? WHERE clerk_user_id = ?",
+            (_now_iso(), clerk_user_id),
+        )
+        self.conn.commit()
