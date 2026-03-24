@@ -4,7 +4,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -326,6 +326,43 @@ class SQLiteStateStore:
         cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_sub_stripe_customer
         ON subscriptions(stripe_customer_id)
+        """)
+
+        # Budget guardrails
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS budgets (
+            budget_id         TEXT PRIMARY KEY,
+            tenant_id         TEXT NOT NULL,
+            name              TEXT NOT NULL,
+            scope             TEXT NOT NULL DEFAULT 'total',
+            service           TEXT,
+            monthly_limit_usd REAL NOT NULL,
+            alert_thresholds  TEXT NOT NULL DEFAULT '[50,80,100]',
+            action_on_breach  TEXT NOT NULL DEFAULT 'alert',
+            enabled           INTEGER NOT NULL DEFAULT 1,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL
+        )
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_budgets_tenant
+        ON budgets(tenant_id)
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS budget_alerts (
+            alert_id          TEXT PRIMARY KEY,
+            tenant_id         TEXT NOT NULL,
+            budget_id         TEXT NOT NULL,
+            threshold_pct     INTEGER NOT NULL,
+            current_spend_usd REAL NOT NULL,
+            budget_limit_usd  REAL NOT NULL,
+            triggered_at      TEXT NOT NULL
+        )
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_budget_alerts_tenant
+        ON budget_alerts(tenant_id, budget_id, triggered_at)
         """)
 
         self.conn.commit()
@@ -1422,3 +1459,144 @@ class SQLiteStateStore:
             (_now_iso(), clerk_user_id),
         )
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Budgets (spend guardrails)
+    # ------------------------------------------------------------------
+
+    def create_budget(
+        self,
+        tenant_id: str,
+        *,
+        name: str,
+        scope: str = "total",
+        service: Optional[str] = None,
+        monthly_limit_usd: float,
+        alert_thresholds: Optional[List[int]] = None,
+        action_on_breach: str = "alert",
+    ) -> Dict[str, Any]:
+        budget_id = str(uuid.uuid4())
+        now = _now_iso()
+        thresholds = json.dumps(alert_thresholds or [50, 80, 100])
+        cur = self.conn.cursor()
+        cur.execute(
+            """INSERT INTO budgets
+               (budget_id, tenant_id, name, scope, service, monthly_limit_usd,
+                alert_thresholds, action_on_breach, enabled, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+            (budget_id, tenant_id, name, scope, service, monthly_limit_usd,
+             thresholds, action_on_breach, now, now),
+        )
+        self.conn.commit()
+        return self.get_budget(budget_id, tenant_id)  # type: ignore
+
+    def get_budget(self, budget_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM budgets WHERE budget_id = ? AND tenant_id = ?",
+            (budget_id, tenant_id),
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["alert_thresholds"] = json.loads(d.get("alert_thresholds") or "[]")
+        return d
+
+    def list_budgets(self, tenant_id: str) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM budgets WHERE tenant_id = ? ORDER BY created_at DESC",
+            (tenant_id,),
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["alert_thresholds"] = json.loads(d.get("alert_thresholds") or "[]")
+            result.append(d)
+        return result
+
+    def update_budget(
+        self,
+        budget_id: str,
+        tenant_id: str,
+        **kwargs: Any,
+    ) -> Optional[Dict[str, Any]]:
+        allowed = {"name", "monthly_limit_usd", "alert_thresholds", "action_on_breach", "enabled"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+        if not updates:
+            return self.get_budget(budget_id, tenant_id)
+        if "alert_thresholds" in updates:
+            updates["alert_thresholds"] = json.dumps(updates["alert_thresholds"])
+        updates["updated_at"] = _now_iso()
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        vals = list(updates.values()) + [budget_id, tenant_id]
+        self.conn.execute(
+            f"UPDATE budgets SET {set_clause} WHERE budget_id = ? AND tenant_id = ?",
+            vals,
+        )
+        self.conn.commit()
+        return self.get_budget(budget_id, tenant_id)
+
+    def delete_budget(self, budget_id: str, tenant_id: str) -> bool:
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM budgets WHERE budget_id = ? AND tenant_id = ?",
+            (budget_id, tenant_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def record_budget_alert(
+        self,
+        tenant_id: str,
+        budget_id: str,
+        threshold_pct: int,
+        current_spend: float,
+        budget_limit: float,
+    ) -> str:
+        alert_id = str(uuid.uuid4())
+        now = _now_iso()
+        self.conn.execute(
+            """INSERT INTO budget_alerts
+               (alert_id, tenant_id, budget_id, threshold_pct, current_spend_usd,
+                budget_limit_usd, triggered_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (alert_id, tenant_id, budget_id, threshold_pct, current_spend, budget_limit, now),
+        )
+        self.conn.commit()
+        return alert_id
+
+    def list_budget_alerts(self, tenant_id: str, budget_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        if budget_id:
+            rows = self.conn.execute(
+                "SELECT * FROM budget_alerts WHERE tenant_id = ? AND budget_id = ? ORDER BY triggered_at DESC LIMIT ?",
+                (tenant_id, budget_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM budget_alerts WHERE tenant_id = ? ORDER BY triggered_at DESC LIMIT ?",
+                (tenant_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_last_budget_alert(self, tenant_id: str, budget_id: str, threshold_pct: int) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            """SELECT * FROM budget_alerts
+               WHERE tenant_id = ? AND budget_id = ? AND threshold_pct = ?
+               ORDER BY triggered_at DESC LIMIT 1""",
+            (tenant_id, budget_id, threshold_pct),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_current_month_spend(self, tenant_id: str, service: Optional[str] = None) -> float:
+        now = datetime.now(timezone.utc)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        if service:
+            row = self.conn.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0) as total FROM cost_snapshots WHERE tenant_id = ? AND service = ? AND hour >= ?",
+                (tenant_id, service, month_start),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0) as total FROM cost_snapshots WHERE tenant_id = ? AND hour >= ?",
+                (tenant_id, month_start),
+            ).fetchone()
+        return float(row["total"]) if row else 0.0
