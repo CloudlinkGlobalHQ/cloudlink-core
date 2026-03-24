@@ -407,6 +407,29 @@ class SQLiteStateStore:
         ON autostop_events(tenant_id, created_at)
         """)
 
+        # ── Team members ────────────────────────────────────────────────────
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS team_members (
+            member_id       TEXT PRIMARY KEY,
+            tenant_id       TEXT NOT NULL,
+            email           TEXT NOT NULL,
+            name            TEXT,
+            role            TEXT NOT NULL DEFAULT 'viewer',
+            invited_by      TEXT,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        )
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_team_members_tenant
+        ON team_members(tenant_id)
+        """)
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_team_members_tenant_email
+        ON team_members(tenant_id, email)
+        """)
+
         self.conn.commit()
 
     def _migrate_tables(self) -> None:
@@ -1797,3 +1820,75 @@ class SQLiteStateStore:
                 (tenant_id, month_start),
             ).fetchone()
         return float(row["total"]) if row else 0.0
+
+    # ------------------------------------------------------------------
+    # Team Members
+    # ------------------------------------------------------------------
+
+    def invite_team_member(
+        self,
+        tenant_id: str,
+        email: str,
+        role: str = "viewer",
+        name: Optional[str] = None,
+        invited_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        member_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """INSERT INTO team_members
+               (member_id, tenant_id, email, name, role, invited_by, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+            (member_id, tenant_id, email, name, role, invited_by, now, now),
+        )
+        self.conn.commit()
+        return self.get_team_member(tenant_id, member_id)
+
+    def list_team_members(self, tenant_id: str) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM team_members WHERE tenant_id = ? ORDER BY created_at",
+            (tenant_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_team_member(self, tenant_id: str, member_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM team_members WHERE tenant_id = ? AND member_id = ?",
+            (tenant_id, member_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_team_member(
+        self,
+        tenant_id: str,
+        member_id: str,
+        role: Optional[str] = None,
+        status: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        now = datetime.now(timezone.utc).isoformat()
+        fields, params = [], []
+        if role is not None:
+            fields.append("role = ?"); params.append(role)
+        if status is not None:
+            fields.append("status = ?"); params.append(status)
+        if name is not None:
+            fields.append("name = ?"); params.append(name)
+        if not fields:
+            return self.get_team_member(tenant_id, member_id)
+        fields.append("updated_at = ?"); params.append(now)
+        params += [tenant_id, member_id]
+        self.conn.execute(
+            f"UPDATE team_members SET {', '.join(fields)} WHERE tenant_id = ? AND member_id = ?",
+            params,
+        )
+        self.conn.commit()
+        return self.get_team_member(tenant_id, member_id)
+
+    def delete_team_member(self, tenant_id: str, member_id: str) -> bool:
+        cur = self.conn.execute(
+            "DELETE FROM team_members WHERE tenant_id = ? AND member_id = ?",
+            (tenant_id, member_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
