@@ -328,7 +328,7 @@ class SQLiteStateStore:
         ON subscriptions(stripe_customer_id)
         """)
 
-        # Budget guardrails
+        # ── Budget guardrails ────────────────────────────────────────────────
         cur.execute("""
         CREATE TABLE IF NOT EXISTS budgets (
             budget_id         TEXT PRIMARY KEY,
@@ -363,6 +363,48 @@ class SQLiteStateStore:
         cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_budget_alerts_tenant
         ON budget_alerts(tenant_id, budget_id, triggered_at)
+        """)
+
+        # ── AutoStop rules ───────────────────────────────────────────────────
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS autostop_rules (
+            rule_id           TEXT PRIMARY KEY,
+            tenant_id         TEXT NOT NULL,
+            name              TEXT NOT NULL,
+            enabled           INTEGER NOT NULL DEFAULT 1,
+            environment_tag   TEXT NOT NULL DEFAULT '*',
+            resource_types    TEXT NOT NULL DEFAULT '["ec2_instance"]',
+            idle_threshold_pct REAL NOT NULL DEFAULT 5.0,
+            idle_lookback_hours INTEGER NOT NULL DEFAULT 24,
+            schedule_stop     TEXT,
+            schedule_start    TEXT,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL
+        )
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_autostop_rules_tenant
+        ON autostop_rules(tenant_id)
+        """)
+
+        # ── AutoStop events ──────────────────────────────────────────────────
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS autostop_events (
+            event_id            TEXT PRIMARY KEY,
+            tenant_id           TEXT NOT NULL,
+            rule_id             TEXT,
+            resource_id         TEXT NOT NULL,
+            resource_type       TEXT NOT NULL,
+            action              TEXT NOT NULL,
+            reason              TEXT,
+            savings_usd_est     REAL,
+            region              TEXT,
+            created_at          TEXT NOT NULL
+        )
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_autostop_events_tenant
+        ON autostop_events(tenant_id, created_at)
         """)
 
         self.conn.commit()
@@ -1357,6 +1399,161 @@ class SQLiteStateStore:
         d = dict(row)
         d["deploy_metadata"] = json.loads(d.get("deploy_metadata") or "{}")
         return d
+
+    # ------------------------------------------------------------------
+    # AutoStop Rules
+    # ------------------------------------------------------------------
+
+    def create_autostop_rule(
+        self,
+        tenant_id: str,
+        name: str,
+        environment_tag: str = "*",
+        resource_types: Optional[List[str]] = None,
+        idle_threshold_pct: float = 5.0,
+        idle_lookback_hours: int = 24,
+        schedule_stop: Optional[str] = None,
+        schedule_start: Optional[str] = None,
+        enabled: bool = True,
+    ) -> str:
+        rule_id = str(uuid.uuid4())
+        now = _now_iso()
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT INTO autostop_rules
+                (rule_id, tenant_id, name, enabled, environment_tag, resource_types,
+                 idle_threshold_pct, idle_lookback_hours, schedule_stop, schedule_start,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            rule_id, tenant_id, name, int(enabled), environment_tag,
+            json.dumps(resource_types or ["ec2_instance"]),
+            idle_threshold_pct, idle_lookback_hours,
+            schedule_stop, schedule_start, now, now,
+        ))
+        self.conn.commit()
+        return rule_id
+
+    def list_autostop_rules(self, tenant_id: str) -> List[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT * FROM autostop_rules WHERE tenant_id = ? ORDER BY created_at DESC
+        """, (tenant_id,))
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            d["resource_types"] = json.loads(d.get("resource_types") or '["ec2_instance"]')
+            d["enabled"] = bool(d["enabled"])
+            rows.append(d)
+        return rows
+
+    def get_autostop_rule(self, rule_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT * FROM autostop_rules WHERE rule_id = ? AND tenant_id = ?
+        """, (rule_id, tenant_id))
+        row = cur.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["resource_types"] = json.loads(d.get("resource_types") or '["ec2_instance"]')
+        d["enabled"] = bool(d["enabled"])
+        return d
+
+    def update_autostop_rule(self, rule_id: str, tenant_id: str, updates: Dict[str, Any]) -> bool:
+        allowed = {
+            "name", "enabled", "environment_tag", "resource_types",
+            "idle_threshold_pct", "idle_lookback_hours", "schedule_stop", "schedule_start",
+        }
+        fields = {k: v for k, v in updates.items() if k in allowed}
+        if not fields:
+            return False
+        if "resource_types" in fields:
+            fields["resource_types"] = json.dumps(fields["resource_types"])
+        if "enabled" in fields:
+            fields["enabled"] = int(bool(fields["enabled"]))
+        fields["updated_at"] = _now_iso()
+        set_clause = ", ".join(f"{k} = ?" for k in fields)
+        vals = list(fields.values()) + [rule_id, tenant_id]
+        cur = self.conn.cursor()
+        cur.execute(
+            f"UPDATE autostop_rules SET {set_clause} WHERE rule_id = ? AND tenant_id = ?",
+            vals,
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def delete_autostop_rule(self, rule_id: str, tenant_id: str) -> bool:
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM autostop_rules WHERE rule_id = ? AND tenant_id = ?",
+            (rule_id, tenant_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # AutoStop Events
+    # ------------------------------------------------------------------
+
+    def log_autostop_event(
+        self,
+        tenant_id: str,
+        resource_id: str,
+        resource_type: str,
+        action: str,
+        rule_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        savings_usd_est: Optional[float] = None,
+        region: Optional[str] = None,
+    ) -> str:
+        event_id = str(uuid.uuid4())
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT INTO autostop_events
+                (event_id, tenant_id, rule_id, resource_id, resource_type,
+                 action, reason, savings_usd_est, region, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            event_id, tenant_id, rule_id, resource_id, resource_type,
+            action, reason, savings_usd_est, region, _now_iso(),
+        ))
+        self.conn.commit()
+        return event_id
+
+    def list_autostop_events(
+        self,
+        tenant_id: str,
+        limit: int = 100,
+        resource_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        if resource_id:
+            cur.execute("""
+                SELECT * FROM autostop_events
+                WHERE tenant_id = ? AND resource_id = ?
+                ORDER BY created_at DESC LIMIT ?
+            """, (tenant_id, resource_id, limit))
+        else:
+            cur.execute("""
+                SELECT * FROM autostop_events
+                WHERE tenant_id = ?
+                ORDER BY created_at DESC LIMIT ?
+            """, (tenant_id, limit))
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_autostop_savings(self, tenant_id: str) -> Dict[str, Any]:
+        """Return estimated total savings and stopped resource count."""
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE action = 'stopped') AS total_stopped,
+                COUNT(*) FILTER (WHERE action = 'started') AS total_started,
+                COALESCE(SUM(savings_usd_est) FILTER (WHERE action = 'stopped'), 0) AS total_savings_usd
+            FROM autostop_events WHERE tenant_id = ?
+        """, (tenant_id,))
+        row = cur.fetchone()
+        return dict(row) if row else {"total_stopped": 0, "total_started": 0, "total_savings_usd": 0.0}
 
     def fire_webhooks(self, tenant_id: str, event_type: str, payload: Dict[str, Any]) -> None:
         """Fire matching webhooks for a tenant event. Errors are silently swallowed."""
