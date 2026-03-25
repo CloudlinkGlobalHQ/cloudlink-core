@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cloudlink_core.state.crypto import decrypt_credential, encrypt_credential, mask_credential
+from cloudlink_core.state.postgres_analytics import PostgresAnalyticsStore
+from cloudlink_core.state.postgres_credentials import PostgresCredentialStore
+from cloudlink_core.state.postgres_governance import PostgresGovernanceStore
+from cloudlink_core.state.postgres_identity import PostgresIdentityStore
+from cloudlink_core.state.postgres_integrations import PostgresIntegrationStore
+from cloudlink_core.state.postgres_operations import PostgresOperationStore
+from cloudlink_core.state.postgres_product_analytics import PostgresProductAnalyticsStore
+from cloudlink_core.state.postgres_runs import PostgresRunStore
+from cloudlink_core.state.postgres_subscriptions import PostgresSubscriptionStore
 
 
 def _now_iso() -> str:
@@ -54,6 +64,53 @@ class SQLiteStateStore:
 
     def __init__(self, db_path: str = "cloudlink.db"):
         self.db_path = Path(db_path)
+        self._pg_analytics: Optional[PostgresAnalyticsStore] = None
+        self._pg_credentials: Optional[PostgresCredentialStore] = None
+        self._pg_governance: Optional[PostgresGovernanceStore] = None
+        self._pg_identity: Optional[PostgresIdentityStore] = None
+        self._pg_integrations: Optional[PostgresIntegrationStore] = None
+        self._pg_operations: Optional[PostgresOperationStore] = None
+        self._pg_product_analytics: Optional[PostgresProductAnalyticsStore] = None
+        self._pg_runs: Optional[PostgresRunStore] = None
+        self._pg_subscriptions: Optional[PostgresSubscriptionStore] = None
+        database_url = os.environ.get("DATABASE_URL", "").strip()
+        if database_url.startswith("postgres://") or database_url.startswith("postgresql://"):
+            try:
+                self._pg_analytics = PostgresAnalyticsStore(database_url)
+            except Exception:
+                self._pg_analytics = None
+            try:
+                self._pg_credentials = PostgresCredentialStore(database_url)
+            except Exception:
+                self._pg_credentials = None
+            try:
+                self._pg_governance = PostgresGovernanceStore(database_url)
+            except Exception:
+                self._pg_governance = None
+            try:
+                self._pg_identity = PostgresIdentityStore(database_url)
+            except Exception:
+                self._pg_identity = None
+            try:
+                self._pg_integrations = PostgresIntegrationStore(database_url)
+            except Exception:
+                self._pg_integrations = None
+            try:
+                self._pg_operations = PostgresOperationStore(database_url)
+            except Exception:
+                self._pg_operations = None
+            try:
+                self._pg_product_analytics = PostgresProductAnalyticsStore(database_url)
+            except Exception:
+                self._pg_product_analytics = None
+            try:
+                self._pg_runs = PostgresRunStore(database_url)
+            except Exception:
+                self._pg_runs = None
+            try:
+                self._pg_subscriptions = PostgresSubscriptionStore(database_url)
+            except Exception:
+                self._pg_subscriptions = None
         self.conn = sqlite3.connect(
             self.db_path,
             check_same_thread=False,
@@ -508,6 +565,8 @@ class SQLiteStateStore:
         self.conn.commit()
 
     def _seed_default_tenant(self) -> None:
+        if self._pg_identity is not None:
+            self._pg_identity.seed_default_tenant()
         cur = self.conn.cursor()
         cur.execute("""
             INSERT OR IGNORE INTO tenants (tenant_id, name, status, created_at)
@@ -520,6 +579,9 @@ class SQLiteStateStore:
     # ------------------------------------------------------------------
 
     def create_tenant(self, name: str) -> str:
+        if self._pg_identity is not None:
+            return self._pg_identity.create_tenant(name)
+
         tenant_id = str(uuid.uuid4())
         cur = self.conn.cursor()
         cur.execute("""
@@ -530,12 +592,18 @@ class SQLiteStateStore:
         return tenant_id
 
     def get_tenant(self, tenant_id: str) -> Optional[Dict[str, Any]]:
+        if self._pg_identity is not None:
+            return self._pg_identity.get_tenant(tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,))
         row = cur.fetchone()
         return dict(row) if row else None
 
     def list_tenants(self) -> List[Dict[str, Any]]:
+        if self._pg_identity is not None:
+            return self._pg_identity.list_tenants()
+
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM tenants ORDER BY created_at")
         return [dict(r) for r in cur.fetchall()]
@@ -546,6 +614,9 @@ class SQLiteStateStore:
 
     def add_api_key(self, tenant_id: str, raw_key: str, label: Optional[str] = None) -> str:
         """Store a hashed API key for a tenant. Returns the key_hash."""
+        if self._pg_identity is not None:
+            return self._pg_identity.add_api_key(tenant_id, raw_key, label)
+
         key_hash = _hash_api_key(raw_key)
         cur = self.conn.cursor()
         cur.execute("""
@@ -557,6 +628,9 @@ class SQLiteStateStore:
 
     def get_tenant_id_for_api_key(self, raw_key: str) -> Optional[str]:
         """Look up a tenant_id by raw API key. Returns None if not found."""
+        if self._pg_identity is not None:
+            return self._pg_identity.get_tenant_id_for_api_key(raw_key)
+
         key_hash = _hash_api_key(raw_key)
         cur = self.conn.cursor()
         cur.execute("""
@@ -578,6 +652,15 @@ class SQLiteStateStore:
         label: Optional[str] = None,
     ) -> str:
         """Encrypt and store a cloud credential. Returns credential_id."""
+        if self._pg_credentials is not None:
+            return self._pg_credentials.add_credential(
+                tenant_id=tenant_id,
+                cloud=cloud,
+                credential_type=credential_type,
+                payload=payload,
+                label=label,
+            )
+
         credential_id = str(uuid.uuid4())
         encrypted = encrypt_credential(payload)
         cur = self.conn.cursor()
@@ -591,6 +674,9 @@ class SQLiteStateStore:
 
     def list_credentials(self, tenant_id: str) -> List[Dict[str, Any]]:
         """List credentials for a tenant. Payload is masked — never returns plaintext."""
+        if self._pg_credentials is not None:
+            return self._pg_credentials.list_credentials(tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT credential_id, tenant_id, cloud, label, credential_type, created_at, last_verified_at
@@ -602,6 +688,9 @@ class SQLiteStateStore:
 
     def get_decrypted_credential(self, tenant_id: str, credential_id: str) -> Optional[str]:
         """Return the decrypted payload for a credential. Only called by executors."""
+        if self._pg_credentials is not None:
+            return self._pg_credentials.get_decrypted_credential(tenant_id, credential_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT encrypted_payload FROM cloud_credentials
@@ -613,6 +702,9 @@ class SQLiteStateStore:
         return decrypt_credential(row["encrypted_payload"])
 
     def delete_credential(self, tenant_id: str, credential_id: str) -> bool:
+        if self._pg_credentials is not None:
+            return self._pg_credentials.delete_credential(tenant_id, credential_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             DELETE FROM cloud_credentials
@@ -622,6 +714,10 @@ class SQLiteStateStore:
         return cur.rowcount > 0
 
     def mark_credential_verified(self, tenant_id: str, credential_id: str) -> None:
+        if self._pg_credentials is not None:
+            self._pg_credentials.mark_credential_verified(tenant_id, credential_id)
+            return
+
         cur = self.conn.cursor()
         cur.execute("""
             UPDATE cloud_credentials SET last_verified_at = ?
@@ -638,6 +734,9 @@ class SQLiteStateStore:
         Return the approval policy for a tenant+action_type.
         Defaults to require_approval=True if no policy is set.
         """
+        if self._pg_governance is not None:
+            return self._pg_governance.get_approval_policy(tenant_id, action_type)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT require_approval, auto_approve_min_confidence
@@ -660,6 +759,12 @@ class SQLiteStateStore:
         require_approval: bool,
         auto_approve_min_confidence: Optional[float] = None,
     ) -> None:
+        if self._pg_governance is not None:
+            self._pg_governance.set_approval_policy(
+                tenant_id, action_type, require_approval, auto_approve_min_confidence
+            )
+            return
+
         cur = self.conn.cursor()
         cur.execute("""
             INSERT INTO approval_policies
@@ -672,6 +777,9 @@ class SQLiteStateStore:
         self.conn.commit()
 
     def list_approval_policies(self, tenant_id: str) -> List[Dict[str, Any]]:
+        if self._pg_governance is not None:
+            return self._pg_governance.list_approval_policies(tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT action_type, require_approval, auto_approve_min_confidence
@@ -692,6 +800,10 @@ class SQLiteStateStore:
     # ------------------------------------------------------------------
 
     def ingest_event(self, event: Dict[str, Any], tenant_id: str = DEFAULT_TENANT) -> None:
+        if self._pg_operations is not None:
+            self._pg_operations.ingest_event(event, tenant_id)
+            return
+
         resource_id = event.get("resource_id")
         if not resource_id:
             raise ValueError("event must contain resource_id")
@@ -704,6 +816,9 @@ class SQLiteStateStore:
         self.conn.commit()
 
     def get_resource(self, resource_id: str, tenant_id: str = DEFAULT_TENANT) -> Optional[Dict[str, Any]]:
+        if self._pg_operations is not None:
+            return self._pg_operations.get_resource(resource_id, tenant_id)
+
         cur = self.conn.cursor()
         cur.execute(
             "SELECT payload FROM resources WHERE resource_id = ? AND tenant_id = ?",
@@ -713,6 +828,9 @@ class SQLiteStateStore:
         return json.loads(row["payload"]) if row else None
 
     def list_resources(self, tenant_id: str = DEFAULT_TENANT) -> List[Dict[str, Any]]:
+        if self._pg_operations is not None:
+            return self._pg_operations.list_resources(tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("SELECT payload FROM resources WHERE tenant_id = ?", (tenant_id,))
         return [json.loads(r["payload"]) for r in cur.fetchall()]
@@ -722,6 +840,10 @@ class SQLiteStateStore:
     # ------------------------------------------------------------------
 
     def ingest_execution_result(self, result: Dict[str, Any], tenant_id: str = DEFAULT_TENANT) -> None:
+        if self._pg_operations is not None:
+            self._pg_operations.ingest_execution_result(result, tenant_id)
+            return
+
         action_id = result.get("action_id")
         if not action_id:
             raise ValueError("execution result must contain action_id")
@@ -742,6 +864,9 @@ class SQLiteStateStore:
 
     def list_execution_results(self, tenant_id: str = DEFAULT_TENANT) -> Dict[str, Dict[str, Any]]:
         """Return latest result per action_id, scoped to tenant."""
+        if self._pg_operations is not None:
+            return self._pg_operations.list_execution_results(tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT er.action_id, er.payload
@@ -758,6 +883,9 @@ class SQLiteStateStore:
         return {r["action_id"]: json.loads(r["payload"]) for r in cur.fetchall()}
 
     def list_execution_results_for_action(self, action_id: str) -> List[Dict[str, Any]]:
+        if self._pg_operations is not None:
+            return self._pg_operations.list_execution_results_for_action(action_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT payload FROM execution_results
@@ -767,6 +895,9 @@ class SQLiteStateStore:
         return [json.loads(r["payload"]) for r in cur.fetchall()]
 
     def last_success_completed_at(self, resource_id: str, action_type: str, tenant_id: str = DEFAULT_TENANT) -> Optional[str]:
+        if self._pg_operations is not None:
+            return self._pg_operations.last_success_completed_at(resource_id, action_type, tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT completed_at FROM execution_results
@@ -810,6 +941,11 @@ class SQLiteStateStore:
             action.get("confidence"),
         )
 
+        action_to_store = dict(action)
+        action_to_store["status"] = initial_status
+        if self._pg_operations is not None:
+            return self._pg_operations.create_action_if_new(action_to_store, tenant_id)
+
         cur = self.conn.cursor()
         try:
             cur.execute("""
@@ -819,22 +955,22 @@ class SQLiteStateStore:
                     next_retry_at, last_error, reason, confidence, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                action["action_id"],
+                action_to_store["action_id"],
                 tenant_id,
-                action["action_key"],
-                action.get("agent"),
-                action["action_type"],
-                action["resource_id"],
-                action.get("resource_type"),
-                _stable_json(action.get("proposed_change") or {}),
-                initial_status,
-                int(action.get("attempt_count") or 0),
-                action.get("next_retry_at"),
-                action.get("last_error"),
-                action.get("reason"),
-                action.get("confidence"),
-                action["created_at"],
-                action["updated_at"],
+                action_to_store["action_key"],
+                action_to_store.get("agent"),
+                action_to_store["action_type"],
+                action_to_store["resource_id"],
+                action_to_store.get("resource_type"),
+                _stable_json(action_to_store.get("proposed_change") or {}),
+                action_to_store["status"],
+                int(action_to_store.get("attempt_count") or 0),
+                action_to_store.get("next_retry_at"),
+                action_to_store.get("last_error"),
+                action_to_store.get("reason"),
+                action_to_store.get("confidence"),
+                action_to_store["created_at"],
+                action_to_store["updated_at"],
             ))
             self.conn.commit()
             return True
@@ -843,6 +979,9 @@ class SQLiteStateStore:
 
     def claim_actions(self, limit: int, tenant_id: str = DEFAULT_TENANT) -> List[Dict[str, Any]]:
         """Atomically claim PENDING/RETRY actions for a tenant, setting them IN_PROGRESS."""
+        if self._pg_operations is not None:
+            return self._pg_operations.claim_actions(limit, tenant_id)
+
         now = _now_iso()
         cur = self.conn.cursor()
         cur.execute("""
@@ -878,6 +1017,17 @@ class SQLiteStateStore:
         next_retry_at: Optional[str] = None,
         last_error: Optional[str] = None,
     ) -> None:
+        if self._pg_operations is not None:
+            self._pg_operations.update_action(
+                action_id,
+                status=status,
+                updated_at=updated_at,
+                attempt_count=attempt_count,
+                next_retry_at=next_retry_at,
+                last_error=last_error,
+            )
+            return
+
         updated_at = updated_at or _now_iso()
         sets = ["status = ?", "updated_at = ?"]
         params: List[Any] = [status, updated_at]
@@ -897,6 +1047,9 @@ class SQLiteStateStore:
 
     def approve_action(self, action_id: str, tenant_id: str) -> bool:
         """Move an AWAITING_APPROVAL action to PENDING so it can be claimed."""
+        if self._pg_operations is not None:
+            return self._pg_operations.approve_action(action_id, tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             UPDATE actions SET status='PENDING', updated_at=?
@@ -907,6 +1060,9 @@ class SQLiteStateStore:
 
     def reject_action(self, action_id: str, tenant_id: str) -> bool:
         """Move an AWAITING_APPROVAL action to FAILED."""
+        if self._pg_operations is not None:
+            return self._pg_operations.reject_action(action_id, tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             UPDATE actions SET status='FAILED', updated_at=?
@@ -916,6 +1072,10 @@ class SQLiteStateStore:
         return cur.rowcount > 0
 
     def force_retry_action(self, action_id: str) -> None:
+        if self._pg_operations is not None:
+            self._pg_operations.force_retry_action(action_id)
+            return
+
         cur = self.conn.cursor()
         cur.execute("""
             UPDATE actions SET status='RETRY', next_retry_at=NULL, updated_at=?
@@ -925,6 +1085,9 @@ class SQLiteStateStore:
 
     def has_active_action(self, resource_id: str, action_type: str, tenant_id: str = DEFAULT_TENANT) -> bool:
         """Return True if an active action exists for this tenant+resource+type."""
+        if self._pg_operations is not None:
+            return self._pg_operations.has_active_action(resource_id, action_type, tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT COUNT(*) AS n FROM actions
@@ -938,6 +1101,9 @@ class SQLiteStateStore:
     # ------------------------------------------------------------------
 
     def create_run(self, tenant_id: str = DEFAULT_TENANT) -> str:
+        if self._pg_runs is not None:
+            return self._pg_runs.create_run(tenant_id)
+
         run_id = str(uuid.uuid4())
         cur = self.conn.cursor()
         cur.execute("""
@@ -957,6 +1123,17 @@ class SQLiteStateStore:
         failed_count: int,
         retry_count: int,
     ) -> None:
+        if self._pg_runs is not None:
+            self._pg_runs.finish_run(
+                run_id,
+                proposed_count=proposed_count,
+                claimed_count=claimed_count,
+                success_count=success_count,
+                failed_count=failed_count,
+                retry_count=retry_count,
+            )
+            return
+
         cur = self.conn.cursor()
         cur.execute("""
             UPDATE runs
@@ -970,6 +1147,9 @@ class SQLiteStateStore:
         self.conn.commit()
 
     def list_runs(self, limit: int = 50, tenant_id: str = DEFAULT_TENANT) -> List[Dict[str, Any]]:
+        if self._pg_runs is not None:
+            return self._pg_runs.list_runs(limit=limit, tenant_id=tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT * FROM runs WHERE tenant_id = ?
@@ -1003,6 +1183,9 @@ class SQLiteStateStore:
         }
 
     def get_action(self, action_id: str, tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        if self._pg_operations is not None:
+            return self._pg_operations.get_action(action_id, tenant_id)
+
         cur = self.conn.cursor()
         if tenant_id:
             cur.execute("SELECT * FROM actions WHERE action_id = ? AND tenant_id = ?", (action_id, tenant_id))
@@ -1018,6 +1201,9 @@ class SQLiteStateStore:
         offset: int = 0,
         tenant_id: str = DEFAULT_TENANT,
     ) -> List[Dict[str, Any]]:
+        if self._pg_operations is not None:
+            return self._pg_operations.list_actions(status, limit, offset, tenant_id)
+
         cur = self.conn.cursor()
         if status:
             cur.execute("""
@@ -1040,6 +1226,9 @@ class SQLiteStateStore:
         return out
 
     def count_actions_by_status(self, tenant_id: str = DEFAULT_TENANT) -> Dict[str, int]:
+        if self._pg_operations is not None:
+            return self._pg_operations.count_actions_by_status(tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT status, COUNT(*) AS n FROM actions
@@ -1059,6 +1248,14 @@ class SQLiteStateStore:
         credential_label: Optional[str] = None,
         regions: Optional[List[str]] = None,
     ) -> str:
+        if self._pg_integrations is not None:
+            return self._pg_integrations.create_scan(
+                tenant_id=tenant_id,
+                credential_id=credential_id,
+                credential_label=credential_label,
+                regions=regions,
+            )
+
         scan_id = str(uuid.uuid4())
         cur = self.conn.cursor()
         cur.execute("""
@@ -1081,6 +1278,16 @@ class SQLiteStateStore:
         actions_queued: int = 0,
         error: Optional[str] = None,
     ) -> None:
+        if self._pg_integrations is not None:
+            self._pg_integrations.finish_scan(
+                scan_id,
+                events_found=events_found,
+                events_ingested=events_ingested,
+                actions_queued=actions_queued,
+                error=error,
+            )
+            return
+
         status = "error" if error else "finished"
         cur = self.conn.cursor()
         cur.execute("""
@@ -1091,6 +1298,9 @@ class SQLiteStateStore:
         self.conn.commit()
 
     def list_scans(self, tenant_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        if self._pg_integrations is not None:
+            return self._pg_integrations.list_scans(tenant_id, limit)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT * FROM scan_history WHERE tenant_id = ?
@@ -1117,6 +1327,9 @@ class SQLiteStateStore:
         secret: Optional[str] = None,
         events: Optional[List[str]] = None,
     ) -> str:
+        if self._pg_integrations is not None:
+            return self._pg_integrations.add_webhook(tenant_id, url, secret, events)
+
         webhook_id = str(uuid.uuid4())
         default_events = ["action.created", "action.completed", "scan.finished"]
         cur = self.conn.cursor()
@@ -1131,6 +1344,9 @@ class SQLiteStateStore:
         return webhook_id
 
     def list_webhooks(self, tenant_id: str) -> List[Dict[str, Any]]:
+        if self._pg_integrations is not None:
+            return self._pg_integrations.list_webhooks(tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT * FROM webhooks WHERE tenant_id = ? ORDER BY created_at
@@ -1146,6 +1362,9 @@ class SQLiteStateStore:
         return rows
 
     def delete_webhook(self, tenant_id: str, webhook_id: str) -> bool:
+        if self._pg_integrations is not None:
+            return self._pg_integrations.delete_webhook(tenant_id, webhook_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             DELETE FROM webhooks WHERE webhook_id = ? AND tenant_id = ?
@@ -1154,6 +1373,10 @@ class SQLiteStateStore:
         return cur.rowcount > 0
 
     def update_webhook_status(self, webhook_id: str, status: str) -> None:
+        if self._pg_integrations is not None:
+            self._pg_integrations.update_webhook_status(webhook_id, status)
+            return
+
         cur = self.conn.cursor()
         cur.execute("""
             UPDATE webhooks SET last_fired_at=?, last_status=? WHERE webhook_id=?
@@ -1177,6 +1400,16 @@ class SQLiteStateStore:
         credential_id: Optional[str] = None,
     ) -> None:
         """Upsert a per-service hourly cost reading. Idempotent on (tenant, service, hour)."""
+        if self._pg_analytics is not None:
+            self._pg_analytics.record_cost_snapshot(
+                tenant_id=tenant_id,
+                service=service,
+                hour=hour,
+                cost_usd=cost_usd,
+                credential_id=credential_id,
+            )
+            return
+
         snapshot_id = str(uuid.uuid4())
         cur = self.conn.cursor()
         cur.execute("""
@@ -1200,6 +1433,14 @@ class SQLiteStateStore:
         Return the average hourly cost for `service` over the `lookback_hours` window
         that ends at (but excludes) `before_hour`. Returns None if no data.
         """
+        if self._pg_analytics is not None:
+            return self._pg_analytics.get_cost_baseline(
+                tenant_id=tenant_id,
+                service=service,
+                before_hour=before_hour,
+                lookback_hours=lookback_hours,
+            )
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT AVG(cost_usd) AS avg_cost, COUNT(*) AS n
@@ -1226,6 +1467,14 @@ class SQLiteStateStore:
         Return the average hourly cost for `service` in the `window_hours` window
         starting at `after_hour`. Returns None if no data yet.
         """
+        if self._pg_analytics is not None:
+            return self._pg_analytics.get_post_deploy_cost(
+                tenant_id=tenant_id,
+                service=service,
+                after_hour=after_hour,
+                window_hours=window_hours,
+            )
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT AVG(cost_usd) AS avg_cost, COUNT(*) AS n
@@ -1249,6 +1498,9 @@ class SQLiteStateStore:
         service: Optional[str] = None,
         limit: int = 200,
     ) -> List[Dict[str, Any]]:
+        if self._pg_analytics is not None:
+            return self._pg_analytics.list_cost_snapshots(tenant_id, service=service, limit=limit)
+
         cur = self.conn.cursor()
         if service:
             cur.execute("""
@@ -1266,6 +1518,9 @@ class SQLiteStateStore:
 
     def list_tracked_services(self, tenant_id: str) -> List[str]:
         """Return distinct service names that have cost snapshots."""
+        if self._pg_analytics is not None:
+            return self._pg_analytics.list_tracked_services(tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT DISTINCT service FROM cost_snapshots
@@ -1288,6 +1543,17 @@ class SQLiteStateStore:
         source: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
+        if self._pg_analytics is not None:
+            return self._pg_analytics.create_deploy_event(
+                tenant_id=tenant_id,
+                service=service,
+                deployed_at=deployed_at,
+                version=version,
+                environment=environment,
+                source=source,
+                metadata=metadata,
+            )
+
         deploy_id = str(uuid.uuid4())
         cur = self.conn.cursor()
         cur.execute("""
@@ -1302,6 +1568,9 @@ class SQLiteStateStore:
         return deploy_id
 
     def get_deploy_event(self, deploy_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        if self._pg_analytics is not None:
+            return self._pg_analytics.get_deploy_event(deploy_id, tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT * FROM deploy_events WHERE deploy_id = ? AND tenant_id = ?
@@ -1319,6 +1588,9 @@ class SQLiteStateStore:
         service: Optional[str] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
+        if self._pg_analytics is not None:
+            return self._pg_analytics.list_deploy_events(tenant_id, service=service, limit=limit)
+
         cur = self.conn.cursor()
         if service:
             cur.execute("""
@@ -1349,6 +1621,12 @@ class SQLiteStateStore:
           1. Were deployed at least `min_hours_elapsed` hours ago
           2. Do not yet have a regression record (checked or clean)
         """
+        if self._pg_analytics is not None:
+            return self._pg_analytics.get_deploys_pending_analysis(
+                tenant_id=tenant_id,
+                min_hours_elapsed=min_hours_elapsed,
+            )
+
         cutoff = datetime.now(timezone.utc) - timedelta(hours=min_hours_elapsed)
         cutoff_iso = cutoff.isoformat()
         cur = self.conn.cursor()
@@ -1385,6 +1663,18 @@ class SQLiteStateStore:
         monthly_impact: float,
         confidence: str = "high",
     ) -> str:
+        if self._pg_analytics is not None:
+            return self._pg_analytics.create_regression(
+                tenant_id=tenant_id,
+                deploy_id=deploy_id,
+                service=service,
+                baseline_cost=baseline_cost,
+                post_cost=post_cost,
+                change_pct=change_pct,
+                monthly_impact=monthly_impact,
+                confidence=confidence,
+            )
+
         regression_id = str(uuid.uuid4())
         cur = self.conn.cursor()
         try:
@@ -1406,6 +1696,9 @@ class SQLiteStateStore:
         return regression_id
 
     def acknowledge_regression(self, regression_id: str, tenant_id: str) -> bool:
+        if self._pg_analytics is not None:
+            return self._pg_analytics.acknowledge_regression(regression_id, tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             UPDATE cost_regressions SET status = 'acknowledged'
@@ -1415,6 +1708,9 @@ class SQLiteStateStore:
         return cur.rowcount > 0
 
     def resolve_regression(self, regression_id: str, tenant_id: str) -> bool:
+        if self._pg_analytics is not None:
+            return self._pg_analytics.resolve_regression(regression_id, tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             UPDATE cost_regressions SET status = 'resolved'
@@ -1429,6 +1725,9 @@ class SQLiteStateStore:
         status: Optional[str] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
+        if self._pg_analytics is not None:
+            return self._pg_analytics.list_regressions(tenant_id, status=status, limit=limit)
+
         cur = self.conn.cursor()
         if status:
             cur.execute("""
@@ -1454,6 +1753,9 @@ class SQLiteStateStore:
         return rows
 
     def get_regression(self, regression_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        if self._pg_analytics is not None:
+            return self._pg_analytics.get_regression(regression_id, tenant_id)
+
         cur = self.conn.cursor()
         cur.execute("""
             SELECT r.*, d.version, d.environment, d.deployed_at, d.source, d.metadata AS deploy_metadata
@@ -1671,6 +1973,17 @@ class SQLiteStateStore:
         status: str = "active",
         current_period_end: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if self._pg_subscriptions is not None:
+            return self._pg_subscriptions.upsert_subscription(
+                clerk_user_id,
+                tenant_id=tenant_id,
+                stripe_customer_id=stripe_customer_id,
+                stripe_subscription_id=stripe_subscription_id,
+                plan=plan,
+                status=status,
+                current_period_end=current_period_end,
+            )
+
         now = _now_iso()
         cur = self.conn.cursor()
         existing = cur.execute(
@@ -1705,6 +2018,9 @@ class SQLiteStateStore:
         return self.get_subscription(clerk_user_id)  # type: ignore
 
     def get_subscription(self, clerk_user_id: str) -> Optional[Dict[str, Any]]:
+        if self._pg_subscriptions is not None:
+            return self._pg_subscriptions.get_subscription(clerk_user_id)
+
         row = self.conn.execute(
             "SELECT * FROM subscriptions WHERE clerk_user_id = ?",
             (clerk_user_id,),
@@ -1712,6 +2028,9 @@ class SQLiteStateStore:
         return dict(row) if row else None
 
     def get_subscription_by_customer(self, stripe_customer_id: str) -> Optional[Dict[str, Any]]:
+        if self._pg_subscriptions is not None:
+            return self._pg_subscriptions.get_subscription_by_customer(stripe_customer_id)
+
         row = self.conn.execute(
             "SELECT * FROM subscriptions WHERE stripe_customer_id = ?",
             (stripe_customer_id,),
@@ -1719,11 +2038,31 @@ class SQLiteStateStore:
         return dict(row) if row else None
 
     def cancel_subscription(self, clerk_user_id: str) -> None:
+        if self._pg_subscriptions is not None:
+            self._pg_subscriptions.cancel_subscription(clerk_user_id)
+            return
+
         self.conn.execute(
             "UPDATE subscriptions SET status = 'cancelled', plan = 'free', updated_at = ? WHERE clerk_user_id = ?",
             (_now_iso(), clerk_user_id),
         )
         self.conn.commit()
+
+    def get_tenant_active_plan(self, tenant_id: str) -> Optional[str]:
+        if self._pg_subscriptions is not None:
+            return self._pg_subscriptions.get_tenant_active_plan(tenant_id)
+
+        row = self.conn.execute(
+            """
+            SELECT plan
+            FROM subscriptions
+            WHERE tenant_id = ? AND status = 'active'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (tenant_id,),
+        ).fetchone()
+        return row[0] if row else None
 
     # ------------------------------------------------------------------
     # Budgets (spend guardrails)
@@ -1740,6 +2079,17 @@ class SQLiteStateStore:
         alert_thresholds: Optional[List[int]] = None,
         action_on_breach: str = "alert",
     ) -> Dict[str, Any]:
+        if self._pg_governance is not None:
+            return self._pg_governance.create_budget(
+                tenant_id,
+                name=name,
+                scope=scope,
+                service=service,
+                monthly_limit_usd=monthly_limit_usd,
+                alert_thresholds=alert_thresholds,
+                action_on_breach=action_on_breach,
+            )
+
         budget_id = str(uuid.uuid4())
         now = _now_iso()
         thresholds = json.dumps(alert_thresholds or [50, 80, 100])
@@ -1756,6 +2106,9 @@ class SQLiteStateStore:
         return self.get_budget(budget_id, tenant_id)  # type: ignore
 
     def get_budget(self, budget_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+        if self._pg_governance is not None:
+            return self._pg_governance.get_budget(budget_id, tenant_id)
+
         row = self.conn.execute(
             "SELECT * FROM budgets WHERE budget_id = ? AND tenant_id = ?",
             (budget_id, tenant_id),
@@ -1767,6 +2120,9 @@ class SQLiteStateStore:
         return d
 
     def list_budgets(self, tenant_id: str) -> List[Dict[str, Any]]:
+        if self._pg_governance is not None:
+            return self._pg_governance.list_budgets(tenant_id)
+
         rows = self.conn.execute(
             "SELECT * FROM budgets WHERE tenant_id = ? ORDER BY created_at DESC",
             (tenant_id,),
@@ -1784,6 +2140,9 @@ class SQLiteStateStore:
         tenant_id: str,
         **kwargs: Any,
     ) -> Optional[Dict[str, Any]]:
+        if self._pg_governance is not None:
+            return self._pg_governance.update_budget(budget_id, tenant_id, **kwargs)
+
         allowed = {"name", "monthly_limit_usd", "alert_thresholds", "action_on_breach", "enabled"}
         updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
         if not updates:
@@ -1801,6 +2160,9 @@ class SQLiteStateStore:
         return self.get_budget(budget_id, tenant_id)
 
     def delete_budget(self, budget_id: str, tenant_id: str) -> bool:
+        if self._pg_governance is not None:
+            return self._pg_governance.delete_budget(budget_id, tenant_id)
+
         cur = self.conn.cursor()
         cur.execute(
             "DELETE FROM budgets WHERE budget_id = ? AND tenant_id = ?",
@@ -1817,6 +2179,11 @@ class SQLiteStateStore:
         current_spend: float,
         budget_limit: float,
     ) -> str:
+        if self._pg_governance is not None:
+            return self._pg_governance.record_budget_alert(
+                tenant_id, budget_id, threshold_pct, current_spend, budget_limit
+            )
+
         alert_id = str(uuid.uuid4())
         now = _now_iso()
         self.conn.execute(
@@ -1830,6 +2197,9 @@ class SQLiteStateStore:
         return alert_id
 
     def list_budget_alerts(self, tenant_id: str, budget_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        if self._pg_governance is not None:
+            return self._pg_governance.list_budget_alerts(tenant_id, budget_id, limit)
+
         if budget_id:
             rows = self.conn.execute(
                 "SELECT * FROM budget_alerts WHERE tenant_id = ? AND budget_id = ? ORDER BY triggered_at DESC LIMIT ?",
@@ -1843,6 +2213,9 @@ class SQLiteStateStore:
         return [dict(r) for r in rows]
 
     def get_last_budget_alert(self, tenant_id: str, budget_id: str, threshold_pct: int) -> Optional[Dict[str, Any]]:
+        if self._pg_governance is not None:
+            return self._pg_governance.get_last_budget_alert(tenant_id, budget_id, threshold_pct)
+
         row = self.conn.execute(
             """SELECT * FROM budget_alerts
                WHERE tenant_id = ? AND budget_id = ? AND threshold_pct = ?
@@ -1852,6 +2225,9 @@ class SQLiteStateStore:
         return dict(row) if row else None
 
     def get_current_month_spend(self, tenant_id: str, service: Optional[str] = None) -> float:
+        if self._pg_analytics is not None:
+            return self._pg_analytics.get_current_month_spend(tenant_id, service=service)
+
         now = datetime.now(timezone.utc)
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
         if service:
@@ -1941,6 +2317,8 @@ class SQLiteStateStore:
     # ── Virtual Tags ──────────────────────────────────────────────────────────
 
     def create_virtual_tag(self, tenant_id: str, name: str, color: str = "#6366f1", rules: list = None) -> str:
+        if self._pg_product_analytics is not None:
+            return self._pg_product_analytics.create_virtual_tag(tenant_id, name, color=color, rules=rules)
         import uuid
         tag_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
@@ -1953,6 +2331,8 @@ class SQLiteStateStore:
         return tag_id
 
     def list_virtual_tags(self, tenant_id: str) -> list:
+        if self._pg_product_analytics is not None:
+            return self._pg_product_analytics.list_virtual_tags(tenant_id)
         import json as _json
         rows = self.conn.execute(
             "SELECT * FROM virtual_tags WHERE tenant_id = ? ORDER BY name",
@@ -1967,6 +2347,8 @@ class SQLiteStateStore:
         return result
 
     def get_virtual_tag(self, tenant_id: str, tag_id: str) -> Optional[Dict[str, Any]]:
+        if self._pg_product_analytics is not None:
+            return self._pg_product_analytics.get_virtual_tag(tenant_id, tag_id)
         import json as _json
         row = self.conn.execute(
             "SELECT * FROM virtual_tags WHERE tenant_id = ? AND tag_id = ?",
@@ -1980,6 +2362,8 @@ class SQLiteStateStore:
         return d
 
     def update_virtual_tag(self, tenant_id: str, tag_id: str, name: str = None, color: str = None, rules: list = None) -> Optional[Dict[str, Any]]:
+        if self._pg_product_analytics is not None:
+            return self._pg_product_analytics.update_virtual_tag(tenant_id, tag_id, name=name, color=color, rules=rules)
         import json as _json
         now = datetime.now(timezone.utc).isoformat()
         fields, params = [], []
@@ -1998,6 +2382,8 @@ class SQLiteStateStore:
         return self.get_virtual_tag(tenant_id, tag_id)
 
     def delete_virtual_tag(self, tenant_id: str, tag_id: str) -> bool:
+        if self._pg_product_analytics is not None:
+            return self._pg_product_analytics.delete_virtual_tag(tenant_id, tag_id)
         cur = self.conn.execute(
             "DELETE FROM virtual_tags WHERE tenant_id = ? AND tag_id = ?",
             (tenant_id, tag_id)
@@ -2008,6 +2394,8 @@ class SQLiteStateStore:
     # ── Kubernetes cost records ────────────────────────────────────────────────
 
     def ingest_k8s_cost_records(self, tenant_id: str, records: list) -> int:
+        if self._pg_product_analytics is not None:
+            return self._pg_product_analytics.ingest_k8s_cost_records(tenant_id, records)
         import uuid, json as _json
         now_iso = datetime.now(timezone.utc).isoformat()
         count = 0
@@ -2042,6 +2430,10 @@ class SQLiteStateStore:
 
     def list_k8s_cost_records(self, tenant_id: str, cluster: str = None, namespace: str = None,
                                hours_back: int = 168, limit: int = 10000) -> list:
+        if self._pg_product_analytics is not None:
+            return self._pg_product_analytics.list_k8s_cost_records(
+                tenant_id, cluster=cluster, namespace=namespace, hours_back=hours_back, limit=limit
+            )
         import json as _json
         from datetime import timedelta
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()[:13]
@@ -2062,6 +2454,8 @@ class SQLiteStateStore:
         return result
 
     def get_k8s_cost_summary(self, tenant_id: str, hours_back: int = 168) -> dict:
+        if self._pg_product_analytics is not None:
+            return self._pg_product_analytics.get_k8s_cost_summary(tenant_id, hours_back=hours_back)
         from datetime import timedelta
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()[:13] + ":00:00"
         # By namespace
