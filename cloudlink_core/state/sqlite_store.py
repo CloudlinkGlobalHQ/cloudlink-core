@@ -430,6 +430,51 @@ class SQLiteStateStore:
         ON team_members(tenant_id, email)
         """)
 
+        # ── Virtual Tags ─────────────────────────────────────────────────────
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS virtual_tags (
+            tag_id      TEXT PRIMARY KEY,
+            tenant_id   TEXT NOT NULL,
+            name        TEXT NOT NULL,
+            color       TEXT NOT NULL DEFAULT '#6366f1',
+            rules       TEXT NOT NULL DEFAULT '[]',
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        )
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_virtual_tags_tenant
+        ON virtual_tags(tenant_id)
+        """)
+
+        # ── Kubernetes cost records ───────────────────────────────────────────
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS k8s_cost_records (
+            id          TEXT PRIMARY KEY,
+            tenant_id   TEXT NOT NULL,
+            cluster     TEXT NOT NULL,
+            namespace   TEXT NOT NULL,
+            pod         TEXT,
+            container   TEXT,
+            node        TEXT,
+            cpu_cores   REAL DEFAULT 0,
+            mem_gib     REAL DEFAULT 0,
+            cpu_cost_usd  REAL DEFAULT 0,
+            mem_cost_usd  REAL DEFAULT 0,
+            total_cost_usd REAL DEFAULT 0,
+            hour        TEXT NOT NULL,
+            labels      TEXT DEFAULT '{}'
+        )
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_k8s_cost_tenant_hour
+        ON k8s_cost_records(tenant_id, hour)
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_k8s_cost_namespace
+        ON k8s_cost_records(tenant_id, cluster, namespace)
+        """)
+
         self.conn.commit()
 
     def _migrate_tables(self) -> None:
@@ -1892,3 +1937,165 @@ class SQLiteStateStore:
         )
         self.conn.commit()
         return cur.rowcount > 0
+
+    # ── Virtual Tags ──────────────────────────────────────────────────────────
+
+    def create_virtual_tag(self, tenant_id: str, name: str, color: str = "#6366f1", rules: list = None) -> str:
+        import uuid
+        tag_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        import json as _json
+        self.conn.execute(
+            "INSERT INTO virtual_tags (tag_id, tenant_id, name, color, rules, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (tag_id, tenant_id, name, color, _json.dumps(rules or []), now, now),
+        )
+        self.conn.commit()
+        return tag_id
+
+    def list_virtual_tags(self, tenant_id: str) -> list:
+        import json as _json
+        rows = self.conn.execute(
+            "SELECT * FROM virtual_tags WHERE tenant_id = ? ORDER BY name",
+            (tenant_id,)
+        ).fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            try: d["rules"] = _json.loads(d.get("rules") or "[]")
+            except Exception: d["rules"] = []
+            result.append(d)
+        return result
+
+    def get_virtual_tag(self, tenant_id: str, tag_id: str) -> Optional[Dict[str, Any]]:
+        import json as _json
+        row = self.conn.execute(
+            "SELECT * FROM virtual_tags WHERE tenant_id = ? AND tag_id = ?",
+            (tenant_id, tag_id)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try: d["rules"] = _json.loads(d.get("rules") or "[]")
+        except Exception: d["rules"] = []
+        return d
+
+    def update_virtual_tag(self, tenant_id: str, tag_id: str, name: str = None, color: str = None, rules: list = None) -> Optional[Dict[str, Any]]:
+        import json as _json
+        now = datetime.now(timezone.utc).isoformat()
+        fields, params = [], []
+        if name is not None: fields.append("name = ?"); params.append(name)
+        if color is not None: fields.append("color = ?"); params.append(color)
+        if rules is not None: fields.append("rules = ?"); params.append(_json.dumps(rules))
+        if not fields:
+            return self.get_virtual_tag(tenant_id, tag_id)
+        fields.append("updated_at = ?"); params.append(now)
+        params += [tenant_id, tag_id]
+        self.conn.execute(
+            f"UPDATE virtual_tags SET {', '.join(fields)} WHERE tenant_id = ? AND tag_id = ?",
+            params,
+        )
+        self.conn.commit()
+        return self.get_virtual_tag(tenant_id, tag_id)
+
+    def delete_virtual_tag(self, tenant_id: str, tag_id: str) -> bool:
+        cur = self.conn.execute(
+            "DELETE FROM virtual_tags WHERE tenant_id = ? AND tag_id = ?",
+            (tenant_id, tag_id)
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    # ── Kubernetes cost records ────────────────────────────────────────────────
+
+    def ingest_k8s_cost_records(self, tenant_id: str, records: list) -> int:
+        import uuid, json as _json
+        now_iso = datetime.now(timezone.utc).isoformat()
+        count = 0
+        for rec in records:
+            rec_id = str(uuid.uuid4())
+            hour = rec.get("hour") or now_iso[:13] + ":00:00"
+            self.conn.execute(
+                """INSERT OR REPLACE INTO k8s_cost_records
+                   (id, tenant_id, cluster, namespace, pod, container, node,
+                    cpu_cores, mem_gib, cpu_cost_usd, mem_cost_usd, total_cost_usd, hour, labels)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    rec.get("id") or rec_id,
+                    tenant_id,
+                    rec.get("cluster", "default"),
+                    rec.get("namespace", "default"),
+                    rec.get("pod"),
+                    rec.get("container"),
+                    rec.get("node"),
+                    float(rec.get("cpu_cores", 0)),
+                    float(rec.get("mem_gib", 0)),
+                    float(rec.get("cpu_cost_usd", 0)),
+                    float(rec.get("mem_cost_usd", 0)),
+                    float(rec.get("total_cost_usd", 0)),
+                    hour,
+                    _json.dumps(rec.get("labels") or {}),
+                ),
+            )
+            count += 1
+        self.conn.commit()
+        return count
+
+    def list_k8s_cost_records(self, tenant_id: str, cluster: str = None, namespace: str = None,
+                               hours_back: int = 168, limit: int = 10000) -> list:
+        import json as _json
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()[:13]
+        query = "SELECT * FROM k8s_cost_records WHERE tenant_id = ? AND hour >= ?"
+        params: list = [tenant_id, cutoff + ":00:00"]
+        if cluster:
+            query += " AND cluster = ?"; params.append(cluster)
+        if namespace:
+            query += " AND namespace = ?"; params.append(namespace)
+        query += f" ORDER BY hour DESC LIMIT {int(limit)}"
+        rows = self.conn.execute(query, params).fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            try: d["labels"] = _json.loads(d.get("labels") or "{}")
+            except Exception: d["labels"] = {}
+            result.append(d)
+        return result
+
+    def get_k8s_cost_summary(self, tenant_id: str, hours_back: int = 168) -> dict:
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()[:13] + ":00:00"
+        # By namespace
+        ns_rows = self.conn.execute(
+            """SELECT cluster, namespace,
+                      SUM(cpu_cost_usd) as cpu_cost, SUM(mem_cost_usd) as mem_cost,
+                      SUM(total_cost_usd) as total_cost
+               FROM k8s_cost_records
+               WHERE tenant_id = ? AND hour >= ?
+               GROUP BY cluster, namespace
+               ORDER BY total_cost DESC""",
+            (tenant_id, cutoff)
+        ).fetchall()
+        # By cluster
+        cl_rows = self.conn.execute(
+            """SELECT cluster, SUM(total_cost_usd) as total_cost
+               FROM k8s_cost_records
+               WHERE tenant_id = ? AND hour >= ?
+               GROUP BY cluster
+               ORDER BY total_cost DESC""",
+            (tenant_id, cutoff)
+        ).fetchall()
+        total = sum(float(r["total_cost"] or 0) for r in cl_rows)
+        return {
+            "total_cost_usd": round(total, 4),
+            "by_cluster": [{"cluster": r["cluster"], "total_cost_usd": round(float(r["total_cost"] or 0), 4)} for r in cl_rows],
+            "by_namespace": [
+                {
+                    "cluster": r["cluster"],
+                    "namespace": r["namespace"],
+                    "cpu_cost_usd": round(float(r["cpu_cost"] or 0), 4),
+                    "mem_cost_usd": round(float(r["mem_cost"] or 0), 4),
+                    "total_cost_usd": round(float(r["total_cost"] or 0), 4),
+                }
+                for r in ns_rows
+            ],
+        }
