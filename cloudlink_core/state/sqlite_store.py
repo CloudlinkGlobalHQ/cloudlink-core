@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from cloudlink_core.state import pg_compat
 from cloudlink_core.state.crypto import decrypt_credential, encrypt_credential, mask_credential
 from cloudlink_core.state.postgres_analytics import PostgresAnalyticsStore
 from cloudlink_core.state.postgres_credentials import PostgresCredentialStore
@@ -40,6 +41,9 @@ def _hash_api_key(raw_key: str) -> str:
 
 # Statuses that count as "active" — a new action should not be created while one exists
 ACTIVE_STATUSES = ("PENDING", "IN_PROGRESS", "RETRY", "AWAITING_APPROVAL")
+
+
+_PG_SCHEMA_READY: set = set()
 
 
 class SQLiteStateStore:
@@ -74,57 +78,29 @@ class SQLiteStateStore:
         self._pg_runs: Optional[PostgresRunStore] = None
         self._pg_subscriptions: Optional[PostgresSubscriptionStore] = None
         database_url = os.environ.get("DATABASE_URL", "").strip()
-        if database_url.startswith("postgres://") or database_url.startswith("postgresql://"):
-            try:
-                self._pg_analytics = PostgresAnalyticsStore(database_url)
-            except Exception:
-                self._pg_analytics = None
-            try:
-                self._pg_credentials = PostgresCredentialStore(database_url)
-            except Exception:
-                self._pg_credentials = None
-            try:
-                self._pg_governance = PostgresGovernanceStore(database_url)
-            except Exception:
-                self._pg_governance = None
-            try:
-                self._pg_identity = PostgresIdentityStore(database_url)
-            except Exception:
-                self._pg_identity = None
-            try:
-                self._pg_integrations = PostgresIntegrationStore(database_url)
-            except Exception:
-                self._pg_integrations = None
-            try:
-                self._pg_operations = PostgresOperationStore(database_url)
-            except Exception:
-                self._pg_operations = None
-            try:
-                self._pg_product_analytics = PostgresProductAnalyticsStore(database_url)
-            except Exception:
-                self._pg_product_analytics = None
-            try:
-                self._pg_runs = PostgresRunStore(database_url)
-            except Exception:
-                self._pg_runs = None
-            try:
-                self._pg_subscriptions = PostgresSubscriptionStore(database_url)
-            except Exception:
-                self._pg_subscriptions = None
-        self.conn = sqlite3.connect(
-            self.db_path,
-            check_same_thread=False,
-            timeout=30,
-        )
-        self.conn.row_factory = sqlite3.Row
-        # WAL mode: allows concurrent readers + one writer without locking
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA busy_timeout=10000")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.commit()
+        if pg_compat.is_postgres_url(database_url):
+            # All queries run against Postgres through a sqlite3-compatible
+            # connection, so every method shares one code path and one schema.
+            self.conn = pg_compat.connect(database_url)
+            if self.conn.dsn in _PG_SCHEMA_READY:
+                return
+        else:
+            self.conn = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                timeout=30,
+            )
+            self.conn.row_factory = sqlite3.Row
+            # WAL mode: allows concurrent readers + one writer without locking
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA busy_timeout=10000")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.commit()
         self._create_tables()
         self._migrate_tables()
         self._seed_default_tenant()
+        if isinstance(self.conn, pg_compat.Connection):
+            _PG_SCHEMA_READY.add(self.conn.dsn)
 
     # ------------------------------------------------------------------
     # Schema
