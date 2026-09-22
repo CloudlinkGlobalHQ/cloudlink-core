@@ -87,3 +87,12 @@ def test_reconnects_after_server_drops_connection(conn):
         c.execute("SELECT pg_terminate_backend(%s)", (pid,))
     killer.close()
     assert conn.execute("SELECT 2").fetchone()[0] == 2
+
+
+@live
+def test_created_tables_have_rls(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS secrets (id TEXT PRIMARY KEY, v TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS secrets (id TEXT PRIMARY KEY, v TEXT)")  # idempotent
+    conn.execute("INSERT INTO secrets (id, v) VALUES (?, ?)", ("a", "b"))
+    assert conn.execute("SELECT relrowsecurity FROM pg_class WHERE relname = 'secrets'").fetchone()[0] is True
+    assert conn.execute("SELECT v FROM secrets").fetchone()["v"] == "b"  # owner still reads

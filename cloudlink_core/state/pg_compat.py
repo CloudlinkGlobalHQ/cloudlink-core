@@ -27,6 +27,10 @@ handlers keep working.
 The connection runs in autocommit mode: SQLite code commits after nearly every
 statement anyway, and it keeps a failed statement (e.g. a duplicate ALTER
 TABLE ADD COLUMN) from poisoning the rest of the session.
+
+Every table created through this connection gets row-level security enabled
+(with no policies), so on Supabase the tables are not readable through the
+auto-generated REST API. The owning role used by the app bypasses RLS.
 """
 from __future__ import annotations
 
@@ -95,6 +99,7 @@ _RE_DATE_NOW = re.compile(r"\bdate\(\s*'now'\s*\)", re.I)
 _RE_GROUP_CONCAT = re.compile(r"GROUP_CONCAT\(\s*([^)]+?)\s*\)", re.I)
 _RE_RANDOM_HEX = re.compile(r"lower\(\s*hex\(\s*randomblob\(\s*16\s*\)\s*\)\s*\)", re.I)
 _RE_BLOB = re.compile(r"\bBLOB\b", re.I)
+_RE_CREATE_TABLE = re.compile(r"^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w\"]+)", re.I)
 _RE_PRAGMA = re.compile(r"^\s*PRAGMA\s+(\w+)\s*(?:\(\s*([\w\"]+)\s*\))?", re.I)
 
 
@@ -320,6 +325,16 @@ class Connection:
         )
 
     def _run(self, sql: str, params: Any, cur: Optional[Cursor], raw_sql: bool = True):
+        result = self._exec(sql, params, cur, raw_sql)
+        created = _RE_CREATE_TABLE.match(sql) if raw_sql else None
+        if created:
+            # Hosted Postgres like Supabase exposes the public schema over a REST
+            # API; RLS with no policies closes that off. We connect as the table
+            # owner, which bypasses RLS, so the app itself is unaffected.
+            self._exec(f"ALTER TABLE {created.group(1)} ENABLE ROW LEVEL SECURITY", None, None, False)
+        return result
+
+    def _exec(self, sql: str, params: Any, cur: Optional[Cursor], raw_sql: bool = True):
         if raw_sql:
             pm = _RE_PRAGMA.match(sql)
             if pm:
